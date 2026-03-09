@@ -73,7 +73,7 @@ BETA_HOPFIELD    = 60.0
 TOPK             = 50
 N_EVAL           = 300    # number of pairs used in next-frame prediction eval
 
-FORCE_RETRAIN_TEACHER  = False
+FORCE_RETRAIN_TEACHER  = True   # rebuild saved model with SamplingLayer fix
 FORCE_RETRAIN_STUDENTS = False
 FORCE_REBUILD_KV       = False
 
@@ -105,6 +105,17 @@ def load_shapes3d_with_labels(n):
 # ─────────────────────────────────────────────
 # Model architecture (shared between teacher and students)
 # ─────────────────────────────────────────────
+@keras.saving.register_keras_serializable()
+class SamplingLayer(layers.Layer):
+    """Reparameterisation trick as a registered Keras layer.
+    Replaces Lambda so the encoder can be saved and loaded correctly.
+    """
+    def call(self, inputs):
+        z_mean, z_logvar = inputs
+        eps = tf.random.normal(shape=tf.shape(z_mean))
+        return z_mean + tf.exp(0.5 * z_logvar) * eps
+
+
 def build_encoder_decoder(latent_dim):
     """Standard conv VAE matching Spens & Burgess architecture."""
     enc_in = keras.Input(shape=(64, 64, 3))
@@ -115,13 +126,7 @@ def build_encoder_decoder(latent_dim):
     x = layers.Dense(128, activation="relu")(x)
     z_mean   = layers.Dense(latent_dim, name="z_mean")(x)
     z_logvar = layers.Dense(latent_dim, name="z_logvar")(x)
-
-    def sample_z(args):
-        m, lv = args
-        eps = tf.random.normal(shape=tf.shape(m))
-        return m + tf.exp(0.5 * lv) * eps
-
-    z = layers.Lambda(sample_z, name="z")([z_mean, z_logvar])
+    z = SamplingLayer(name="z")([z_mean, z_logvar])
     encoder = keras.Model(enc_in, [z_mean, z_logvar, z], name="encoder")
 
     lat_in = keras.Input(shape=(latent_dim,))
