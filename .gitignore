@@ -5,7 +5,7 @@ tfds_data/
 artifacts/
 
 # experiment outputs
-outputs/
+#outputs/
 
 # python
 __pycache__/

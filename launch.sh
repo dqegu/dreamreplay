@@ -15,4 +15,4 @@ conda activate spens-seq
 # Optional: avoid TF grabbing all CPU threads
 export OMP_NUM_THREADS=8
 
-python run_seq_replay.py
+python run_multirun.py

@@ -559,9 +559,29 @@ def save_results_plot(results, out_path):
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
-def main():
+def main(seed=42, run_dir=None):
+    import argparse
+
+    # Allow CLI override when called directly
+    if seed == 42 and run_dir is None:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--seed",    type=int, default=42)
+        parser.add_argument("--run_dir", type=str, default=None)
+        args, _ = parser.parse_known_args()
+        seed    = args.seed
+        run_dir = args.run_dir
+
+    # Per-run output directory (falls back to global OUT_DIR)
+    out = run_dir if run_dir else OUT_DIR
+    os.makedirs(out, exist_ok=True)
+
+    # Reproducibility — students and replay sampling vary by seed;
+    # teacher and K/V are loaded from disk (fixed across runs)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
     print("=" * 60)
-    print("Sequential Predictive vs IID Replay: Consolidation Experiment")
+    print(f"Sequential Predictive vs IID Replay  [seed={seed}]")
     print("(v3: Student B is a predictive model, per Spens & Burgess p.535)")
     print("=" * 60)
 
@@ -572,6 +592,13 @@ def main():
     train_imgs = imgs[:split]
     eval_imgs  = imgs[split:]
     print(f"    Train: {len(train_imgs)}, Eval: {len(eval_imgs)}")
+
+    # Per-run student artifact paths (teacher/KV are shared and fixed)
+    enc_iid_path  = os.path.join(ART_DIR, f"student_iid_encoder_s{seed}.keras")
+    dec_iid_path  = os.path.join(ART_DIR, f"student_iid_decoder_s{seed}.keras")
+    enc_seq_path  = os.path.join(ART_DIR, f"student_seq_encoder_s{seed}.keras")
+    dec_seq_path  = os.path.join(ART_DIR, f"student_seq_decoder_s{seed}.keras")
+    trans_seq_path = os.path.join(ART_DIR, f"student_seq_transition_s{seed}.keras")
 
     # ── 2. Train or load teacher VAE ─────────────────────────────
     print("\n[2/7] Teacher VAE...")
@@ -624,7 +651,7 @@ def main():
     example_chain_imgs = latents_to_images(np.array(example_latents), teacher_dec)
     save_sequence_grid(
         example_chain_imgs,
-        os.path.join(OUT_DIR, "example_dream_chain.png"),
+        os.path.join(out, "example_dream_chain.png"),
         title="Example sequential dream chain (teacher decoder)"
     )
 
@@ -632,11 +659,11 @@ def main():
     print("\n[5/7] Training student models...")
 
     # Student A: standard VAE on IID replay (reconstruction objective)
-    if (os.path.exists(ENC_IID_PATH) and os.path.exists(DEC_IID_PATH)
+    if (os.path.exists(enc_iid_path) and os.path.exists(dec_iid_path)
             and not FORCE_RETRAIN_STUDENTS):
         print("    Loading saved IID student.")
-        student_iid_enc = keras.models.load_model(ENC_IID_PATH, compile=False)
-        student_iid_dec = keras.models.load_model(DEC_IID_PATH, compile=False)
+        student_iid_enc = keras.models.load_model(enc_iid_path, compile=False)
+        student_iid_dec = keras.models.load_model(dec_iid_path, compile=False)
     else:
         print("    Training IID student (reconstruction VAE)...")
         student_iid_enc, student_iid_dec = build_encoder_decoder(LATENT_DIM)
@@ -644,17 +671,17 @@ def main():
         trainer_iid.compile(optimizer=keras.optimizers.Adam(1e-3))
         trainer_iid.fit(iid_replay_imgs,
                         epochs=STUDENT_EPOCHS, batch_size=BATCH_SIZE, verbose=2)
-        student_iid_enc.save(ENC_IID_PATH)
-        student_iid_dec.save(DEC_IID_PATH)
+        student_iid_enc.save(enc_iid_path)
+        student_iid_dec.save(dec_iid_path)
         print("    IID student saved.")
 
     # Student B: predictive model on sequential pairs (prediction objective)
-    if (os.path.exists(ENC_SEQ_PATH) and os.path.exists(DEC_SEQ_PATH)
-            and os.path.exists(TRANS_SEQ_PATH) and not FORCE_RETRAIN_STUDENTS):
+    if (os.path.exists(enc_seq_path) and os.path.exists(dec_seq_path)
+            and os.path.exists(trans_seq_path) and not FORCE_RETRAIN_STUDENTS):
         print("    Loading saved sequential predictive student.")
-        student_seq_enc  = keras.models.load_model(ENC_SEQ_PATH,   compile=False)
-        student_seq_dec  = keras.models.load_model(DEC_SEQ_PATH,   compile=False)
-        student_seq_trans = keras.models.load_model(TRANS_SEQ_PATH, compile=False)
+        student_seq_enc   = keras.models.load_model(enc_seq_path,   compile=False)
+        student_seq_dec   = keras.models.load_model(dec_seq_path,   compile=False)
+        student_seq_trans = keras.models.load_model(trans_seq_path, compile=False)
     else:
         print("    Training sequential predictive student...")
         print("    (encoder + transition MLP, trained to predict frame t+1 from frame t)")
@@ -666,16 +693,15 @@ def main():
         )
         trainer_seq.compile(optimizer=keras.optimizers.Adam(1e-3))
 
-        # Create tf.data dataset of (frame_t, frame_t+1) pairs
         seq_dataset = tf.data.Dataset.from_tensor_slices(
             (seq_frames_t, seq_frames_t1)
         ).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
         trainer_seq.fit(seq_dataset, epochs=STUDENT_EPOCHS, verbose=2)
 
-        student_seq_enc.save(ENC_SEQ_PATH)
-        student_seq_dec.save(DEC_SEQ_PATH)
-        student_seq_trans.save(TRANS_SEQ_PATH)
+        student_seq_enc.save(enc_seq_path)
+        student_seq_dec.save(dec_seq_path)
+        student_seq_trans.save(trans_seq_path)
         print("    Sequential predictive student saved.")
 
     # ── 6. Evaluate ───────────────────────────────────────────────
@@ -721,10 +747,10 @@ def main():
     # ── 7. Save outputs ───────────────────────────────────────────
     print("\n[7/7] Saving outputs...")
 
-    metrics_path = os.path.join(OUT_DIR, "metrics.txt")
+    metrics_path = os.path.join(out, "metrics.txt")
     with open(metrics_path, "w") as f:
         f.write("=" * 60 + "\n")
-        f.write("Sequential Predictive vs IID Replay: Results (v3)\n")
+        f.write(f"Sequential Predictive vs IID Replay: Results (seed={seed})\n")
         f.write("=" * 60 + "\n\n")
         f.write("ARCHITECTURE\n")
         f.write("  Student A: Standard VAE, reconstruction objective, IID replay\n")
@@ -743,7 +769,7 @@ def main():
         f.write("SECONDARY METRIC: Image-space prediction MSE (Student B only)\n")
         f.write("  Shows predictive architecture works; not a comparison point.\n")
         f.write(f"  Seq image prediction MSE:       {seq_img_pred_mse:.6f}\n\n")
-        f.write("SECONDARY METRICS\n")
+        f.write("OTHER METRICS\n")
         f.write(f"  Reconstruction MSE (IID):       {iid_recon:.6f}\n")
         f.write(f"  Reconstruction MSE (Sequential):{seq_recon:.6f}\n")
         f.write(f"  Schema distortion (IID):        {iid_schema:.4f}\n")
@@ -758,7 +784,7 @@ def main():
     frames_t1_pred_vis = student_seq_dec.predict(z_v_pred_vis, verbose=0)
     save_prediction_grid(
         seq_frames_t[:n_vis], seq_frames_t1[:n_vis], frames_t1_pred_vis,
-        os.path.join(OUT_DIR, "prediction_grid.png"),
+        os.path.join(out, "prediction_grid.png"),
         title="Student B: frame t (input) | true frame t+1 | predicted frame t+1"
     )
     print("    Prediction grid saved.")
@@ -772,16 +798,16 @@ def main():
     )
     save_comparison_figure(
         eval_imgs[:n_vis], iid_recon_vis, seq_recon_vis,
-        os.path.join(OUT_DIR, "comparison_recall.png"),
+        os.path.join(out, "comparison_recall.png"),
         title="Original vs IID student recall vs Sequential student recall"
     )
     print("    Comparison figure saved.")
 
-    save_results_plot(results, os.path.join(OUT_DIR, "results_comparison.png"))
+    save_results_plot(results, os.path.join(out, "results_comparison.png"))
     print("    Results plot saved.")
 
     print("\n" + "=" * 60)
-    print("SUMMARY")
+    print(f"SUMMARY  [seed={seed}]")
     print("=" * 60)
     print(f"Next-frame MSE (Ridge probe, identical): IID={iid_nf_mse:.6f}  Seq={seq_nf_mse:.6f}")
     print(f"Image prediction MSE (B):   {seq_img_pred_mse:.6f}")
@@ -789,18 +815,17 @@ def main():
     print(f"Schema distortion ratio:    IID={iid_schema:.4f}  Seq={seq_schema:.4f}")
     if seq_nf_mse < iid_nf_mse:
         print("\n✓ Sequential predictive student has LOWER next-frame prediction MSE.")
-        print("  This SUPPORTS the claim that sequential predictive replay produces")
-        print("  better consolidation of temporally ordered experiences.")
-        print("  Student B was trained to predict transitions; Student A was not.")
-        print("  The comparison is now architecturally fair and theoretically grounded.")
     else:
         print("\n✗ IID student has equal or lower next-frame prediction MSE.")
-        print("  Possible explanations:")
-        print("  - Transition MLP may need more capacity or training epochs")
-        print("  - kl_weight may need tuning for the predictive objective")
-        print("  - Consider evaluating on image-space prediction MSE instead")
     print("=" * 60)
+
+    return results
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed",    type=int, default=42)
+    parser.add_argument("--run_dir", type=str, default=None)
+    args, _ = parser.parse_known_args()
+    main(seed=args.seed, run_dir=args.run_dir)
