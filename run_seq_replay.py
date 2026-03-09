@@ -74,7 +74,7 @@ TOPK             = 50
 N_EVAL           = 300    # number of pairs used in next-frame prediction eval
 
 FORCE_RETRAIN_TEACHER  = True   # rebuild saved model with SamplingLayer fix
-FORCE_RETRAIN_STUDENTS = False
+FORCE_RETRAIN_STUDENTS = True
 FORCE_REBUILD_KV       = False
 
 SEQ_LABEL    = "label_orientation"
@@ -105,7 +105,7 @@ def load_shapes3d_with_labels(n):
 # ─────────────────────────────────────────────
 # Model architecture (shared between teacher and students)
 # ─────────────────────────────────────────────
-@keras.saving.register_keras_serializable()
+@tf.keras.utils.register_keras_serializable(package='spens_seq')
 class SamplingLayer(layers.Layer):
     """Reparameterisation trick as a registered Keras layer.
     Replaces Lambda so the encoder can be saved and loaded correctly.
