@@ -1,7 +1,7 @@
 """
 run_multirun.py
 
-Runs run_seq_replay_v3.py across N_RUNS random seeds, then aggregates
+Runs run_seq_replay.py across N_RUNS random seeds, then aggregates
 results into a summary table with mean ± std for each metric.
 
 Usage (submit via SLURM using the same launch.sh, just swap the script):
@@ -61,9 +61,9 @@ METRIC_LABELS = {
 # ─────────────────────────────────────────────
 # Import the experiment
 # ─────────────────────────────────────────────
-# Add the irp directory to path so we can import run_seq_replay_v3
+# Add the irp directory to path so we can import run_seq_replay
 sys.path.insert(0, BASE_DIR)
-from run_seq_replay_v3 import main as run_experiment
+from run_seq_replay import main as run_experiment
 
 
 # ─────────────────────────────────────────────
