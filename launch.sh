@@ -9,7 +9,7 @@
 #SBATCH --mail-user=your_email@soton.ac.uk
 #SBATCH -o slurm-%j.out
 
-module load conda/py3-latest
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate spens-seq
 
 # Optional: avoid TF grabbing all CPU threads
