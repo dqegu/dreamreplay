@@ -39,7 +39,7 @@ from collections import defaultdict
 # ─────────────────────────────────────────────
 # Paths
 # ─────────────────────────────────────────────
-BASE_DIR = "/home/ao1g22/spens_seq"
+BASE_DIR = "/home/ao1g22/comp6228/irp"
 TFDS_DIR = os.path.join(BASE_DIR, "tfds_data")
 ART_DIR  = os.path.join(BASE_DIR, "artifacts")
 OUT_DIR  = os.path.join(BASE_DIR, "outputs")
@@ -265,33 +265,52 @@ def latents_to_images(latents, decoder):
 # ─────────────────────────────────────────────
 # Evaluation metrics
 # ─────────────────────────────────────────────
-def evaluate_next_frame_prediction(encoder, K, V, K_norm, n=N_EVAL):
+def evaluate_next_frame_prediction(encoder, decoder, K, V, n=N_EVAL):
     """
-    Primary evaluation: next-frame temporal prediction MSE.
+    Primary evaluation: linear probe for temporal prediction MSE.
 
-    For n randomly chosen (K[i], V[i]) pairs, encode K[i] through the
-    student encoder to get z_pred, then measure MSE between z_pred and
-    the student encoding of V[i].
+    The question: does the student's latent space encode sequential structure?
 
-    This tests whether the student's latent space has organised itself
-    to represent sequential structure — i.e. whether consolidation of
-    temporal order has occurred.
+    Method:
+      1. Decode K and V (teacher latents) back to images using the teacher
+         decoder, then re-encode through the STUDENT encoder to get
+         student latent representations z_k and z_v.
+      2. Fit a Ridge regression probe: z_k → z_v on a training split.
+      3. Measure MSE on a held-out test split.
 
-    Lower MSE = better temporal prediction = sequential structure consolidated.
+    If the student's latent space has organised to reflect sequential
+    transitions, z_k will be predictive of z_v and probe MSE will be low.
+    If the latent space is unstructured, the probe will fail.
+
+    Lower MSE = better temporal predictability = sequential structure
+    consolidated into the student's latent space.
+
+    Crucially, this actually passes data through the student encoder,
+    unlike the previous version which only measured the teacher K/V memory.
     """
-    idxs = np.random.choice(len(K), size=min(n, len(K)), replace=False)
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import mean_squared_error
 
-    # We compare student latent of frame t vs student latent of frame t+1
-    # using the Hopfield-predicted next latent as the bridge
-    errs = []
-    for i in idxs:
-        # What the Hopfield memory predicts the next latent should be
-        z_hopfield_next = hopfield_next(K[i], K_norm, V)
-        # What the student encoder produces for the current frame
-        # (we use K[i] directly as it is already in latent space from teacher)
-        # The key question: does z_hopfield_next ≈ V[i] after student training?
-        errs.append(np.mean((z_hopfield_next - V[i])**2))
-    return float(np.mean(errs))
+    n = min(n, len(K))
+    idxs = np.random.choice(len(K), size=n, replace=False)
+    K_sub = K[idxs]
+    V_sub = V[idxs]
+
+    # Decode teacher latents back to image space, then re-encode
+    # through the student to get student latent representations
+    K_imgs = decoder.predict(K_sub, verbose=0)   # (n, 64, 64, 3)
+    V_imgs = decoder.predict(V_sub, verbose=0)   # (n, 64, 64, 3)
+
+    z_k = encoder.predict(K_imgs, verbose=0)[0]  # student z_mean for frame t
+    z_v = encoder.predict(V_imgs, verbose=0)[0]  # student z_mean for frame t+1
+
+    # Train/test split
+    split = int(0.8 * n)
+    probe = Ridge(alpha=1.0)
+    probe.fit(z_k[:split], z_v[:split])
+    z_v_pred = probe.predict(z_k[split:])
+    mse = mean_squared_error(z_v[split:], z_v_pred)
+    return float(mse)
 
 
 def evaluate_reconstruction(encoder, decoder, imgs, n=200):
@@ -546,10 +565,10 @@ def main():
     # Primary metric: next-frame prediction
     # Uses the K/V memory built from teacher latents as ground truth transitions
     iid_nf_mse = evaluate_next_frame_prediction(
-        student_iid_enc, K, V, K_norm, n=N_EVAL
+        student_iid_enc, teacher_dec, K, V, n=N_EVAL
     )
     seq_nf_mse = evaluate_next_frame_prediction(
-        student_seq_enc, K, V, K_norm, n=N_EVAL
+        student_seq_enc, teacher_dec, K, V, n=N_EVAL
     )
     print(f"    Next-frame MSE — IID: {iid_nf_mse:.6f}  |  Sequential: {seq_nf_mse:.6f}")
 
