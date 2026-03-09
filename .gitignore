@@ -1,0 +1,15 @@
+# datasets
+tfds_data/
+
+# training artifacts
+artifacts/
+
+# experiment outputs
+outputs/
+
+# python
+__pycache__/
+*.pyc
+
+# slurm logs
+slurm-*.out
