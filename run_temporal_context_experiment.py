@@ -63,11 +63,7 @@ def load_models(seed: int):
 
 def load_full_shapes3d(n_samples: int):
     imgs, labels = base_exp.load_shapes3d_with_labels(n_samples)
-    split = int(0.8 * n_samples)
-    train_imgs, train_labels = imgs[:split], labels[:split]
-    test_imgs, test_labels = imgs[split:], labels[split:]
-    return train_imgs, train_labels, test_imgs, test_labels
-
+    return imgs, labels
 
 def build_sequences(labels):
     groups = defaultdict(list)
@@ -80,6 +76,16 @@ def build_sequences(labels):
         if len(seq_sorted) >= 5:
             sequences.append(seq_sorted)
     return sequences
+
+def split_sequences(sequences, train_frac: float = 0.8, seed: int = 42):
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(sequences))
+    n_train = int(train_frac * len(sequences))
+    train_idx = order[:n_train]
+    test_idx = order[n_train:]
+    train_sequences = [sequences[i] for i in train_idx]
+    test_sequences = [sequences[i] for i in test_idx]
+    return train_sequences, test_sequences
 
 
 def sample_triplets(imgs, sequences, n_triplets: int, rng: np.random.Generator):
@@ -107,11 +113,18 @@ def sample_rollout_windows(imgs, sequences, horizon: int, n_windows: int, rng: n
     starts = []
     futures = []
     valid_sequences = [seq for seq in sequences if len(seq) >= horizon + 1]
+    if len(valid_sequences) == 0:
+        raise RuntimeError(
+            f'No sequences long enough for rollout horizon={horizon}. '
+            f'Max sequence length was {max(len(s) for s in sequences) if sequences else 0}.'
+        )
+
     for _ in range(n_windows):
         seq = valid_sequences[int(rng.integers(len(valid_sequences)))]
         t = int(rng.integers(0, len(seq) - horizon))
         starts.append(imgs[seq[t]])
         futures.append([imgs[seq[t + h]] for h in range(1, horizon + 1)])
+
     return np.stack(starts), np.stack(futures)
 
 
@@ -283,7 +296,11 @@ def save_metric_plot(results, out_path):
 
 
 def save_example_grid(prev, cur_corr, nxt, out_path, n: int = 8, title: str = ''):
-    fig, axes = plt.subplots(3, n, figsize=(n * 1.5, 5))
+    fig, axes = plt.subplots(3, n, figsize=(max(n, 1) * 1.5, 5))
+    axes = np.array(axes)
+    if n == 1:
+        axes = axes.reshape(3, 1)
+
     labels = ['Previous frame', 'Current frame (corrupted)', 'True next frame']
     for i in range(n):
         axes[0, i].imshow(np.clip(prev[i], 0, 1))
@@ -291,8 +308,10 @@ def save_example_grid(prev, cur_corr, nxt, out_path, n: int = 8, title: str = ''
         axes[2, i].imshow(np.clip(nxt[i], 0, 1))
         for r in range(3):
             axes[r, i].axis('off')
+
     for r, lab in enumerate(labels):
         axes[r, 0].set_ylabel(lab, fontsize=8, rotation=90, labelpad=40)
+
     plt.suptitle(title)
     plt.tight_layout()
     plt.savefig(out_path, dpi=160)
@@ -323,20 +342,30 @@ def main(seed: int = 42,
     teacher_enc, teacher_dec, iid_enc, iid_dec, seq_enc, seq_dec, seq_trans = load_models(seed)
 
     print('[1/4] Loading Shapes3D and building held-out sequences...')
-    train_imgs, train_labels, test_imgs, test_labels = load_full_shapes3d(n_samples)
-    train_sequences = build_sequences(train_labels)
-    test_sequences = build_sequences(test_labels)
-    print(f'  train sequences: {len(train_sequences)} | test sequences: {len(test_sequences)}')
+    imgs, labels = load_full_shapes3d(n_samples)
+    all_sequences = build_sequences(labels)
+    train_sequences, test_sequences = split_sequences(all_sequences, train_frac=0.8, seed=seed)
+    print(f'  all sequences: {len(all_sequences)} | train sequences: {len(train_sequences)} | test sequences: {len(test_sequences)}')
+
+    if len(all_sequences) == 0:
+        raise RuntimeError(
+            'No valid sequences were built from Shapes3D. '
+            'Check base_exp.GROUP_LABELS and base_exp.SEQ_LABEL.'
+        )
+    if len(train_sequences) == 0 or len(test_sequences) == 0:
+        raise RuntimeError(
+            f'Sequence split failed: train={len(train_sequences)}, test={len(test_sequences)}'
+        )
 
     print('[2/4] Sampling train/test pairs and triplets...')
-    pair_train_x, pair_train_y = sample_pairs(train_imgs, train_sequences, n_pair_train, rng)
-    pair_test_x, pair_test_y = sample_pairs(test_imgs, test_sequences, n_pair_test, rng)
+    pair_train_x, pair_train_y = sample_pairs(imgs, train_sequences, n_pair_train, rng)
+    pair_test_x, pair_test_y = sample_pairs(imgs, test_sequences, n_pair_test, rng)
 
-    trip_train_prev, trip_train_cur, trip_train_next = sample_triplets(train_imgs, train_sequences, n_triplet_train, rng)
-    trip_test_prev, trip_test_cur, trip_test_next = sample_triplets(test_imgs, test_sequences, n_triplet_test, rng)
+    trip_train_prev, trip_train_cur, trip_train_next = sample_triplets(imgs, train_sequences, n_triplet_train, rng)
+    trip_test_prev, trip_test_cur, trip_test_next = sample_triplets(imgs, test_sequences, n_triplet_test, rng)
 
-    roll_train_x, roll_train_y = sample_pairs(train_imgs, train_sequences, n_rollout_train, rng)
-    roll_test_start, roll_test_future = sample_rollout_windows(test_imgs, test_sequences, rollout_horizon, n_rollout_test, rng)
+    roll_train_x, roll_train_y = sample_pairs(imgs, train_sequences, n_rollout_train, rng)
+    roll_test_start, roll_test_future = sample_rollout_windows(imgs, test_sequences, rollout_horizon, n_rollout_test, rng)
 
     print('[3/4] Evaluating IID and sequential students...')
     results = {}
@@ -352,7 +381,7 @@ def main(seed: int = 42,
         rollout_steps, rollout_mean = eval_rollout_mse(
             enc, roll_train_x, roll_train_y, roll_test_start, roll_test_future, rollout_horizon
         )
-        adj_mean, far_mean, gap = eval_temporal_contiguity(enc, test_imgs, test_sequences)
+        adj_mean, far_mean, gap = eval_temporal_contiguity(enc, imgs, test_sequences)
 
         results[f'{name}_clean_successor_mse'] = clean_mse
         results[f'{name}_masked_successor_mse'] = masked_mse
@@ -373,12 +402,13 @@ def main(seed: int = 42,
     results['seq_direct_transition_mse'] = float(mean_squared_error(z_seq_true_next, z_seq_pred_next))
 
     print('[4/4] Saving plots and metrics...')
-    _, example_corr = eval_corrupted_successor(seq_enc, pair_train_x, pair_train_y, pair_test_x[:8], pair_test_y[:8], corruption=corruption)
+    n_examples = min(8, len(trip_test_prev))
     save_example_grid(
-        trip_test_prev[:8],
-        center_mask(trip_test_cur[:8]) if corruption == 'mask' else gaussian_noise(trip_test_cur[:8]),
-        trip_test_next[:8],
+        trip_test_prev[:n_examples],
+        center_mask(trip_test_cur[:n_examples]) if corruption == 'mask' else gaussian_noise(trip_test_cur[:n_examples]),
+        trip_test_next[:n_examples],
         os.path.join(out_dir, 'example_temporal_context_grid.png'),
+        n=n_examples,
         title='Temporal-context task: previous | current corrupted | next'
     )
     save_metric_plot(results, os.path.join(out_dir, 'temporal_context_metrics.png'))
