@@ -88,7 +88,7 @@ def save_summary(summary, seeds, out_dir):
     plt.close(fig)
 
 
-def main(seeds):
+def main(seeds, n_samples=2000):
     out_dir = os.path.join(OUT_DIR, 'multirun')
     os.makedirs(out_dir, exist_ok=True)
     all_results = []
@@ -96,7 +96,7 @@ def main(seeds):
         run_dir = os.path.join(out_dir, f'run_{seed}')
         os.makedirs(run_dir, exist_ok=True)
         print(f'\nRunning seed {seed}...')
-        all_results.append(run_once(seed=seed, run_dir=run_dir))
+        all_results.append(run_once(seed=seed, run_dir=run_dir, n_samples=n_samples))
     summary = aggregate(all_results)
     with open(os.path.join(out_dir, 'multirun_summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
@@ -107,5 +107,6 @@ def main(seeds):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--seeds', nargs='*', type=int, default=DEFAULT_SEEDS)
+    parser.add_argument('--n_samples', type=int, default=2000)
     args = parser.parse_args()
-    main(args.seeds)
+    main(args.seeds, args.n_samples)

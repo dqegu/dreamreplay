@@ -14,5 +14,5 @@ conda activate spens-seq
 
 export OMP_NUM_THREADS=8
 
-cd /home/ao1g22/comp6228/irp
-python run_temporal_context_multirun.py
+cd /iridisfs/home/ao1g22/comp6228/irp
+python run_temporal_context_multirun.py --n_samples 50000
