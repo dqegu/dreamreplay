@@ -350,7 +350,7 @@ def main(seed: int = 42,
 
     print('[1/4] Loading Shapes3D and building held-out sequences...')
     imgs, labels = load_full_shapes3d(n_samples)
-    all_sequences = build_sequences(labels, min_len=2)
+    all_sequences = build_sequences(labels, min_len=3)
     train_sequences, test_sequences = split_sequences(all_sequences, train_frac=0.8, seed=seed)
     print(f'  all sequences: {len(all_sequences)} | train sequences: {len(train_sequences)} | test sequences: {len(test_sequences)}')
 

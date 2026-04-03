@@ -54,7 +54,7 @@ from collections import defaultdict
 # ─────────────────────────────────────────────
 # Paths
 # ─────────────────────────────────────────────
-BASE_DIR = "/home/ao1g22/comp6228/irp"
+BASE_DIR = os.environ.get("IRP_BASE_DIR", "/iridisfs/home/ao1g22/comp6228/irp")
 TFDS_DIR = os.path.join(BASE_DIR, "tfds_data")
 ART_DIR  = os.path.join(BASE_DIR, "artifacts")
 OUT_DIR  = os.path.join(BASE_DIR, "outputs")
