@@ -65,15 +65,16 @@ def load_full_shapes3d(n_samples: int):
     imgs, labels = base_exp.load_shapes3d_with_labels(n_samples)
     return imgs, labels
 
-def build_sequences(labels):
+def build_sequences(labels, min_len: int = 2):
     groups = defaultdict(list)
     for i, lab in enumerate(labels):
         gkey = tuple(int(lab[k]) for k in base_exp.GROUP_LABELS)
         groups[gkey].append((int(lab[base_exp.SEQ_LABEL]), i))
+
     sequences = []
     for _, seq in groups.items():
         seq_sorted = [idx for _, idx in sorted(seq, key=lambda x: x[0])]
-        if len(seq_sorted) >= 5:
+        if len(seq_sorted) >= min_len:
             sequences.append(seq_sorted)
     return sequences
 
@@ -343,7 +344,7 @@ def main(seed: int = 42,
 
     print('[1/4] Loading Shapes3D and building held-out sequences...')
     imgs, labels = load_full_shapes3d(n_samples)
-    all_sequences = build_sequences(labels)
+    all_sequences = build_sequences(labels, min_len=2)
     train_sequences, test_sequences = split_sequences(all_sequences, train_frac=0.8, seed=seed)
     print(f'  all sequences: {len(all_sequences)} | train sequences: {len(train_sequences)} | test sequences: {len(test_sequences)}')
 
