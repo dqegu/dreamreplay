@@ -91,8 +91,11 @@ def split_sequences(sequences, train_frac: float = 0.8, seed: int = 42):
 
 def sample_triplets(imgs, sequences, n_triplets: int, rng: np.random.Generator):
     prevs, curs, nexts = [], [], []
+    valid = [s for s in sequences if len(s) >= 3]
+    if not valid:
+        raise ValueError("No sequences long enough to form a triplet (need length >= 3).")
     for _ in range(n_triplets):
-        seq = sequences[int(rng.integers(len(sequences)))]
+        seq = valid[int(rng.integers(len(valid)))]
         t = int(rng.integers(1, len(seq) - 1))
         prevs.append(imgs[seq[t - 1]])
         curs.append(imgs[seq[t]])
@@ -102,8 +105,11 @@ def sample_triplets(imgs, sequences, n_triplets: int, rng: np.random.Generator):
 
 def sample_pairs(imgs, sequences, n_pairs: int, rng: np.random.Generator):
     xs, ys = [], []
+    valid = [s for s in sequences if len(s) >= 2]
+    if not valid:
+        raise ValueError("No sequences long enough to form a pair (need length >= 2).")
     for _ in range(n_pairs):
-        seq = sequences[int(rng.integers(len(sequences)))]
+        seq = valid[int(rng.integers(len(valid)))]
         t = int(rng.integers(0, len(seq) - 1))
         xs.append(imgs[seq[t]])
         ys.append(imgs[seq[t + 1]])
