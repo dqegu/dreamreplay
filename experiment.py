@@ -104,78 +104,210 @@ def reconstruction_mse(encoder, decoder, imgs, sequences, n=200):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Experiment 1 — Partial-cue episode completion
+# Experiment 1A — Probe-based episode completion (fully fair)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def exp1_episode_completion(models, test_imgs, test_seqs,
-                             prefix_len=5, gap_start=5, gap_end=10,
-                             n_seqs=200, rng_seed=0):
+def exp1a_probe_completion(models, train_imgs, train_seqs,
+                            test_imgs, test_seqs,
+                            prefix_len=5, gap_start=5, gap_end=10,
+                            n_train=800, n_test=200, rng_seed=0):
     """
-    Gap-filling task.
+    Probe-based gap-filling task  (Exp 1A — fully fair comparison).
 
-    Each 15-frame sequence is partitioned into:
-      prefix  : frames 0 .. prefix_len-1   (visible to all students)
-      gap     : frames gap_start .. gap_end-1   (hidden; to be reconstructed)
-      suffix  : frames gap_end .. 14       (visible to sequential student only
-                                            as a consistency check; not used
-                                            by IID student)
+    Both students are evaluated through an IDENTICAL downstream predictor
+    fitted on top of their frozen representations.  Neither student's own
+    decoder or transition model is used.  This removes both decoder bias
+    (sequential has a blurrier decoder) and mechanism bias (sequential has
+    a transition MLP, IID does not).
 
-    Sequential student
-      Encode the last prefix frame → z_prefix.
-      Roll the transition MLP forward (gap_end - gap_start) steps.
-      Decode each predicted latent → predicted gap frames.
+    Protocol
+    ────────
+    For each student encoder independently:
 
-    IID-matched student
-      Encode the last prefix frame → z_prefix.
-      Decode z_prefix directly → single reconstructed frame.
-      Tile that reconstruction across the gap as its best estimate.
-      (This is the correct IID baseline: it has no transition model
-       so its only strategy is to reconstruct the current state.)
+      1. Represent each sequence's prefix (frames 0–prefix_len-1) as the
+         CONCATENATION of its per-frame latents → shape (prefix_len × latent_dim,).
 
-    Metric: pixel MSE on hidden gap frames only.
-    Lower = better episode completion.
+      2. Represent the gap target as the CONCATENATION of the TEACHER's
+         latents for frames gap_start–gap_end-1 → shape (gap_len × latent_dim,).
+         The teacher's latent space is used as a shared, objective-neutral
+         reference; neither student's encoder enters the target.
+
+      3. Fit a Ridge regression probe mapping prefix representation → gap
+         target on TRAINING sequences.
+
+      4. Evaluate MSE of the probe's predictions on held-out TEST sequences.
+
+    Interpretation
+    ──────────────
+    A lower test MSE means the learned prefix representation contains more
+    information about the upcoming gap — i.e. the encoder has consolidated
+    more sequential structure regardless of its decoding ability.
+
+    This is the fairest possible Exp 1: same input, same predictor, same
+    target, same metric for both students.
+    """
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import make_pipeline
+
+    rng       = np.random.default_rng(rng_seed)
+    gap_len   = gap_end - gap_start
+    latent_dim = 32  # matches LATENT_DIM in config
+
+    teacher_enc = models["teacher_enc"]
+    encoders = {
+        "sequential":  models["seq_enc"],
+        "iid_matched": models["iid_enc"],
+    }
+
+    # ── Pre-compute teacher latents for gap frames (shared target) ─────────
+    def _teacher_gap_target(imgs, seqs, max_n=None):
+        seqs_ = seqs[:max_n] if max_n else seqs
+        targets = []
+        for seq in seqs_:
+            frames    = imgs[seq]
+            gap_f     = frames[gap_start:gap_end]           # (gap_len, 64,64,3)
+            t_z       = teacher_enc.predict(
+                gap_f, batch_size=gap_len, verbose=0)[0]    # (gap_len, latent_dim)
+            targets.append(t_z.flatten())                   # (gap_len*latent_dim,)
+        return np.stack(targets)
+
+    print("    Building teacher gap targets (train)...")
+    Y_train = _teacher_gap_target(train_imgs, train_seqs, n_train)
+    print("    Building teacher gap targets (test)...")
+    Y_test  = _teacher_gap_target(test_imgs,  test_seqs,  n_test)
+
+    results = {}
+
+    for name, enc in encoders.items():
+        # ── Build prefix representations ────────────────────────────────────
+        def _prefix_repr(imgs, seqs, max_n=None):
+            seqs_ = seqs[:max_n] if max_n else seqs
+            reprs = []
+            for seq in seqs_:
+                frames  = imgs[seq]
+                prefix  = frames[:prefix_len]               # (prefix_len,64,64,3)
+                z_pre   = enc.predict(
+                    prefix, batch_size=prefix_len, verbose=0)[0]  # (prefix_len, d)
+                reprs.append(z_pre.flatten())               # (prefix_len*latent_dim,)
+            return np.stack(reprs)
+
+        print(f"    [{name}] encoding prefix representations...")
+        X_train = _prefix_repr(train_imgs, train_seqs, n_train)
+        X_test  = _prefix_repr(test_imgs,  test_seqs,  n_test)
+
+        # ── Fit identical Ridge probe ────────────────────────────────────────
+        probe = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        probe.fit(X_train, Y_train)
+        Y_pred = probe.predict(X_test)
+
+        # Per-sequence latent MSE
+        seq_mses = np.mean((Y_test - Y_pred) ** 2, axis=1)  # (n_test,)
+        results[name] = {
+            "latent_mse":     float(np.mean(seq_mses)),
+            "latent_mse_std": float(np.std(seq_mses)),
+        }
+        print(f"    [{name}] probe latent MSE = {results[name]['latent_mse']:.5f} "
+              f"± {results[name]['latent_mse_std']:.5f}")
+
+    results["seq_wins"] = int(
+        results["sequential"]["latent_mse"] < results["iid_matched"]["latent_mse"])
+    results["seq_vs_iid"] = float(
+        results["sequential"]["latent_mse"] - results["iid_matched"]["latent_mse"])
+    results["n_test"] = n_test
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Experiment 1B — Native generative completion (behavioural, kept for insight)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def exp1b_generative_completion(models, test_imgs, test_seqs,
+                                 prefix_len=5, gap_start=5, gap_end=10,
+                                 n_seqs=200, rng_seed=0):
+    """
+    Native generative gap-filling  (Exp 1B — behavioural comparison).
+
+    Each student uses its own native mechanism to complete the gap.
+    This is NOT a fair architectural comparison — the sequential student
+    has a transition MLP while the IID student does not — but it reveals
+    what each model actually *does* when asked to complete a sequence.
+    Results should be interpreted as a characterisation of each model's
+    generative behaviour, not as a controlled test of consolidation.
+
+    Sequential : encode last prefix frame → roll transition MLP forward
+                 → decode each step.
+    IID-matched : encode last prefix frame → decode → tile across gap.
+
+    Two metrics:
+      Pixel MSE  — raw pixel comparison (biased toward IID's sharper decoder).
+      Latent MSE — both outputs re-encoded through the teacher; removes
+                   decoder sharpness bias but not mechanism bias.
     """
     rng  = np.random.default_rng(rng_seed)
     idxs = rng.choice(len(test_seqs), size=min(n_seqs, len(test_seqs)),
                       replace=False)
     gap_len = gap_end - gap_start
 
-    seq_enc   = models["seq_enc"]
-    seq_dec   = models["seq_dec"]
-    seq_trans = models["seq_trans"]
-    iid_enc   = models["iid_enc"]
-    iid_dec   = models["iid_dec"]
+    teacher_enc = models["teacher_enc"]
+    seq_enc     = models["seq_enc"]
+    seq_dec     = models["seq_dec"]
+    seq_trans   = models["seq_trans"]
+    iid_enc     = models["iid_enc"]
+    iid_dec     = models["iid_dec"]
 
-    seq_errors, iid_errors = [], []
+    seq_pixel_errors,  iid_pixel_errors  = [], []
+    seq_latent_errors, iid_latent_errors = [], []
 
     for i in idxs:
-        frames = test_imgs[test_seqs[i]]          # (15, 64, 64, 3)
-        gap_frames = frames[gap_start:gap_end]    # ground truth for gap
+        frames     = test_imgs[test_seqs[i]]
+        gap_frames = frames[gap_start:gap_end]               # (gap_len,64,64,3)
 
-        # ── Sequential: roll transition MLP forward from last prefix frame ──
-        last_prefix = frames[prefix_len - 1:prefix_len]  # (1, 64, 64, 3)
-        z = seq_enc.predict(last_prefix, verbose=0)[0]   # (1, latent_dim)
-        predicted_gap = []
+        # Teacher latents for ground-truth gap (shared reference)
+        gt_z = teacher_enc.predict(
+            gap_frames, batch_size=gap_len, verbose=0)[0]   # (gap_len, latent_dim)
+
+        # ── Sequential rollout ───────────────────────────────────────────────
+        last_prefix = frames[prefix_len - 1:prefix_len]
+        z = seq_enc.predict(last_prefix, verbose=0)[0]
+        predicted_gap, pred_z_seq = [], []
         for _ in range(gap_len):
-            z = seq_trans.predict(z, verbose=0)           # (1, latent_dim)
-            frame_pred = seq_dec.predict(z, verbose=0)    # (1, 64, 64, 3)
+            z          = seq_trans.predict(z, verbose=0)
+            frame_pred = seq_dec.predict(z, verbose=0)
             predicted_gap.append(frame_pred[0])
-        predicted_gap = np.stack(predicted_gap)           # (gap_len, 64, 64, 3)
-        seq_errors.append(float(np.mean((gap_frames - predicted_gap) ** 2)))
+            tz = teacher_enc.predict(frame_pred, verbose=0)[0]
+            pred_z_seq.append(tz[0])
+        predicted_gap = np.stack(predicted_gap)
+        pred_z_seq    = np.stack(pred_z_seq)
 
-        # ── IID: reconstruct last prefix frame, tile across gap ──────────────
-        z_iid    = iid_enc.predict(last_prefix, verbose=0)[0]  # (1, latent_dim)
-        recon    = iid_dec.predict(z_iid, verbose=0)           # (1, 64, 64, 3)
-        iid_tiled = np.repeat(recon, gap_len, axis=0)          # (gap_len, 64, 64, 3)
-        iid_errors.append(float(np.mean((gap_frames - iid_tiled) ** 2)))
+        seq_pixel_errors.append(float(np.mean((gap_frames - predicted_gap) ** 2)))
+        seq_latent_errors.append(float(np.mean((gt_z - pred_z_seq) ** 2)))
+
+        # ── IID tiled reconstruction ─────────────────────────────────────────
+        z_iid     = iid_enc.predict(last_prefix, verbose=0)[0]
+        recon     = iid_dec.predict(z_iid, verbose=0)
+        iid_tiled = np.repeat(recon, gap_len, axis=0)
+
+        iid_pixel_errors.append(float(np.mean((gap_frames - iid_tiled) ** 2)))
+        iid_z = teacher_enc.predict(
+            iid_tiled, batch_size=gap_len, verbose=0)[0]
+        iid_latent_errors.append(float(np.mean((gt_z - iid_z) ** 2)))
 
     return {
-        "seq_mse":       float(np.mean(seq_errors)),
-        "seq_mse_std":   float(np.std(seq_errors)),
-        "iid_mse":       float(np.mean(iid_errors)),
-        "iid_mse_std":   float(np.std(iid_errors)),
-        "seq_wins":      int(np.sum(np.array(seq_errors) < np.array(iid_errors))),
-        "n_seqs":        len(seq_errors),
+        "seq_mse":         float(np.mean(seq_pixel_errors)),
+        "seq_mse_std":     float(np.std(seq_pixel_errors)),
+        "iid_mse":         float(np.mean(iid_pixel_errors)),
+        "iid_mse_std":     float(np.std(iid_pixel_errors)),
+        "seq_wins_pixel":  int(np.sum(np.array(seq_pixel_errors) <
+                                      np.array(iid_pixel_errors))),
+        "seq_latent_mse":  float(np.mean(seq_latent_errors)),
+        "seq_latent_std":  float(np.std(seq_latent_errors)),
+        "iid_latent_mse":  float(np.mean(iid_latent_errors)),
+        "iid_latent_std":  float(np.std(iid_latent_errors)),
+        "seq_wins_latent": int(np.sum(np.array(seq_latent_errors) <
+                                      np.array(iid_latent_errors))),
+        "n_seqs":          len(seq_pixel_errors),
     }
 
 
@@ -468,12 +600,29 @@ def run(models: dict,
     all_results["factor_probes"] = probe_results
 
     # ── Experiment 1: Partial-cue episode completion ──────────────────────────
-    print("\n── Exp 1: Partial-cue episode completion ──")
-    exp1 = exp1_episode_completion(models, test_imgs, test_seqs)
-    all_results["exp1_completion"] = exp1
-    print(f"  Sequential MSE: {exp1['seq_mse']:.5f} ± {exp1['seq_mse_std']:.5f}")
-    print(f"  IID-matched MSE: {exp1['iid_mse']:.5f} ± {exp1['iid_mse_std']:.5f}")
-    print(f"  Seq wins on {exp1['seq_wins']}/{exp1['n_seqs']} sequences")
+    # ── Experiment 1A: Probe-based episode completion (fully fair) ───────────
+    print("\n── Exp 1A: Probe-based episode completion (fully fair) ──")
+    exp1a = exp1a_probe_completion(models,
+                                    train_imgs, train_seqs,
+                                    test_imgs,  test_seqs)
+    all_results["exp1a_probe"] = exp1a
+    winner1a = "SEQ ✓" if exp1a["seq_vs_iid"] < 0 else "IID"
+    print(f"  Sequential latent MSE:  {exp1a['sequential']['latent_mse']:.5f} "
+          f"± {exp1a['sequential']['latent_mse_std']:.5f}")
+    print(f"  IID-matched latent MSE: {exp1a['iid_matched']['latent_mse']:.5f} "
+          f"± {exp1a['iid_matched']['latent_mse_std']:.5f}")
+    print(f"  {winner1a} (advantage = {exp1a['seq_vs_iid']:+.5f})")
+
+    # ── Experiment 1B: Native generative completion (behavioural) ────────────
+    print("\n── Exp 1B: Native generative completion (behavioural) ──")
+    exp1b = exp1b_generative_completion(models, test_imgs, test_seqs)
+    all_results["exp1b_generative"] = exp1b
+    print(f"  Pixel MSE  — Seq: {exp1b['seq_mse']:.5f} ± {exp1b['seq_mse_std']:.5f} "
+          f"| IID: {exp1b['iid_mse']:.5f} ± {exp1b['iid_mse_std']:.5f} "
+          f"| Seq wins {exp1b['seq_wins_pixel']}/{exp1b['n_seqs']}")
+    print(f"  Latent MSE — Seq: {exp1b['seq_latent_mse']:.5f} ± {exp1b['seq_latent_std']:.5f} "
+          f"| IID: {exp1b['iid_latent_mse']:.5f} ± {exp1b['iid_latent_std']:.5f} "
+          f"| Seq wins {exp1b['seq_wins_latent']}/{exp1b['n_seqs']}")
 
     # ── Experiment 2: Schema distortion for sequences ─────────────────────────
     print("\n── Exp 2: Schema distortion for sequences ──")
@@ -502,9 +651,9 @@ def run(models: dict,
         json.dump(all_results, f, indent=2)
 
     _print_summary(probe_results)
-    _print_consolidation_summary(exp1, exp2, exp3)
+    _print_consolidation_summary(exp1a, exp1b, exp2, exp3)
     _save_plots(probe_results, out_dir)
-    _save_consolidation_plots(exp1, exp2, exp3, out_dir)
+    _save_consolidation_plots(exp1a, exp1b, exp2, exp3, out_dir)
 
     return all_results
 
@@ -540,17 +689,25 @@ def _print_summary(probe_results):
         print(f"    {name:<14}: {probe_results[name]['recon_mse']:.5f}")
 
 
-def _print_consolidation_summary(exp1, exp2, exp3):
+def _print_consolidation_summary(exp1a, exp1b, exp2, exp3):
     print(f"\n{'═'*80}")
     print("CONSOLIDATION EXPERIMENTS: Sequential vs IID-matched")
     print(f"{'═'*80}")
 
-    print(f"\n  Exp 1 — Episode completion (gap frames 5–9, prefix frames 0–4)")
-    win1 = exp1["seq_mse"] < exp1["iid_mse"]
-    print(f"    Sequential MSE:  {exp1['seq_mse']:.5f} ± {exp1['seq_mse_std']:.5f}")
-    print(f"    IID-matched MSE: {exp1['iid_mse']:.5f} ± {exp1['iid_mse_std']:.5f}")
-    print(f"    {'SEQ WINS ✓' if win1 else 'IID WINS'} — seq wins on "
-          f"{exp1['seq_wins']}/{exp1['n_seqs']} individual sequences")
+    print(f"\n  Exp 1A — Probe-based completion (fully fair, identical ridge probe)")
+    winner = "SEQ ✓" if exp1a["seq_vs_iid"] < 0 else "IID"
+    print(f"    Sequential latent MSE:  {exp1a['sequential']['latent_mse']:.5f} "
+          f"± {exp1a['sequential']['latent_mse_std']:.5f}")
+    print(f"    IID-matched latent MSE: {exp1a['iid_matched']['latent_mse']:.5f} "
+          f"± {exp1a['iid_matched']['latent_mse_std']:.5f}")
+    print(f"    {winner} (advantage = {exp1a['seq_vs_iid']:+.5f})")
+
+    print(f"\n  Exp 1B — Native generative completion (behavioural, not fair comparison)")
+    print(f"    Pixel MSE:  Seq={exp1b['seq_mse']:.5f}  IID={exp1b['iid_mse']:.5f}  "
+          f"Seq wins {exp1b['seq_wins_pixel']}/{exp1b['n_seqs']}")
+    print(f"    Latent MSE: Seq={exp1b['seq_latent_mse']:.5f}  "
+          f"IID={exp1b['iid_latent_mse']:.5f}  "
+          f"Seq wins {exp1b['seq_wins_latent']}/{exp1b['n_seqs']}")
 
     print(f"\n  Exp 2 — Schema distortion (MAD from canonical orientation sweep)")
     print(f"    Canonical MAD (reference):    {exp2['canonical_mad']:.3f}")
@@ -637,29 +794,50 @@ def _save_plots(probe_results, out_dir):
         plt.close()
 
 
-def _save_consolidation_plots(exp1, exp2, exp3, out_dir):
-    """Three-panel figure summarising the consolidation experiments."""
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+def _save_consolidation_plots(exp1a, exp1b, exp2, exp3, out_dir):
+    """Four-panel figure: 1A probe, 1B generative, schema distortion, phase gist."""
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
 
-    # ── Panel 1: Episode completion MSE ──────────────────────────────────────
+    # ── Panel 1: Exp 1A probe-based completion ────────────────────────────────
     ax = axes[0]
-    bars = ax.bar(["IID-matched", "Sequential"],
-                  [exp1["iid_mse"], exp1["seq_mse"]],
-                  color=["steelblue", "coral"], alpha=0.85, width=0.5)
-    ax.errorbar(["IID-matched", "Sequential"],
-                [exp1["iid_mse"], exp1["seq_mse"]],
-                yerr=[exp1["iid_mse_std"], exp1["seq_mse_std"]],
+    vals   = [exp1a["iid_matched"]["latent_mse"],
+              exp1a["sequential"]["latent_mse"]]
+    errs   = [exp1a["iid_matched"]["latent_mse_std"],
+              exp1a["sequential"]["latent_mse_std"]]
+    colors_1a = ["steelblue", "coral"]
+    bars = ax.bar(["IID-matched", "Sequential"], vals,
+                  color=colors_1a, alpha=0.85, width=0.5)
+    ax.errorbar(["IID-matched", "Sequential"], vals, yerr=errs,
                 fmt="none", color="black", capsize=5)
-    for bar, v in zip(bars, [exp1["iid_mse"], exp1["seq_mse"]]):
-        ax.text(bar.get_x() + bar.get_width()/2, v + 0.001,
+    for bar, v in zip(bars, vals):
+        ax.text(bar.get_x() + bar.get_width()/2, v + max(vals)*0.02,
                 f"{v:.4f}", ha="center", va="bottom", fontsize=9)
-    ax.set_ylabel("Pixel MSE (lower = better)")
-    ax.set_title("Exp 1: Episode completion\n"
-                 "(frames 5–9 hidden, predicted from prefix)")
-    ax.set_ylim(0, max(exp1["iid_mse"], exp1["seq_mse"]) * 1.3)
+    ax.set_ylabel("Probe latent MSE (lower = better)")
+    ax.set_title("Exp 1A: Probe-based completion\n"
+                 "(identical ridge probe, teacher latent target — fully fair)")
 
-    # ── Panel 2: Schema distortion — MAD from canonical ──────────────────────
+    # ── Panel 2: Exp 1B native generative ────────────────────────────────────
     ax = axes[1]
+    x_pos = np.array([0, 1, 3, 4])
+    vals2  = [exp1b["iid_mse"], exp1b["seq_mse"],
+              exp1b["iid_latent_mse"], exp1b["seq_latent_mse"]]
+    errs2  = [exp1b["iid_mse_std"], exp1b["seq_mse_std"],
+              exp1b["iid_latent_std"], exp1b["seq_latent_std"]]
+    colors_1b = ["steelblue", "coral", "steelblue", "coral"]
+    bars2 = ax.bar(x_pos, vals2, color=colors_1b, alpha=0.85, width=0.7)
+    ax.errorbar(x_pos, vals2, yerr=errs2, fmt="none", color="black", capsize=5)
+    for bar, v in zip(bars2, vals2):
+        ax.text(bar.get_x() + bar.get_width()/2, v + max(vals2)*0.02,
+                f"{v:.4f}", ha="center", va="bottom", fontsize=8)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(["IID\n(pixel)", "Seq\n(pixel)",
+                         "IID\n(latent)", "Seq\n(latent)"], fontsize=8)
+    ax.set_ylabel("MSE (lower = better)")
+    ax.set_title("Exp 1B: Native generative completion\n"
+                 "(behavioural — architecturally asymmetric)")
+
+    # ── Panel 3: Schema distortion — MAD from canonical ──────────────────────
+    ax = axes[2]
     labels = ["Canonical\n(ref)", "Atypical\ninput",
               "IID\ncompletion", "Seq\ncompletion"]
     vals   = [exp2["canonical_mad"], exp2["atypical_mad"],
@@ -676,8 +854,8 @@ def _save_consolidation_plots(exp1, exp2, exp3, out_dir):
     ax.set_title("Exp 2: Schema distortion\n"
                  "(does recall pull toward canonical orientation trajectory?)")
 
-    # ── Panel 3: Temporal gist — phase accuracy only ─────────────────────────
-    ax     = axes[2]
+    # ── Panel 4: Temporal gist — phase accuracy only ─────────────────────────
+    ax     = axes[3]
     names  = ["teacher", "iid_matched", "iid_mhn", "sequential"]
     labels3 = ["Teacher", "IID-match", "IID-MHN", "Sequential"]
     colors3 = ["seagreen", "steelblue", "mediumpurple", "coral"]

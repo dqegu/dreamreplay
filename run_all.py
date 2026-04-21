@@ -83,7 +83,7 @@ def _agg_scalar(all_results, *keys):
 
 def _aggregate(all_results):
     """Mean ± std across seeds for every metric."""
-    agg = {"factor_probes": {}, "exp1": {}, "exp2": {}, "exp3": {}}
+    agg = {"factor_probes": {}, "exp1a": {}, "exp1b": {}, "exp2": {}, "exp3": {}}
     students = ["teacher", "iid_matched", "iid_mhn", "sequential"]
     factors  = list(PROBE_FACTORS.keys())
 
@@ -106,17 +106,31 @@ def _aggregate(all_results):
                     "std":  float(np.std(vals))  if vals else float("nan"),
                 }
 
-    # ── Exp 1: episode completion ─────────────────────────────────────────────
-    for key in ("seq_mse", "seq_mse_std", "iid_mse", "iid_mse_std"):
-        agg["exp1"][key] = _agg_scalar(all_results, "exp1_completion", key)
-    agg["exp1"]["seq_wins_pct"] = {
-        "mean": float(np.mean([r["exp1_completion"]["seq_wins"] /
-                                r["exp1_completion"]["n_seqs"]
-                                for r in all_results])),
-        "std":  float(np.std([r["exp1_completion"]["seq_wins"] /
-                               r["exp1_completion"]["n_seqs"]
-                               for r in all_results])),
-    }
+    # ── Exp 1A: probe-based completion ───────────────────────────────────────
+    agg["exp1a"] = {"sequential": {}, "iid_matched": {}}
+    for student in ("sequential", "iid_matched"):
+        for key in ("latent_mse", "latent_mse_std"):
+            agg["exp1a"][student][key] = _agg_scalar(
+                all_results, "exp1a_probe", student, key)
+    agg["exp1a"]["seq_vs_iid"] = _agg_scalar(
+        all_results, "exp1a_probe", "seq_vs_iid")
+
+    # ── Exp 1B: native generative completion ──────────────────────────────────
+    agg["exp1b"] = {}
+    for key in ("seq_mse", "seq_mse_std", "iid_mse", "iid_mse_std",
+                "seq_latent_mse", "seq_latent_std",
+                "iid_latent_mse", "iid_latent_std"):
+        agg["exp1b"][key] = _agg_scalar(all_results, "exp1b_generative", key)
+    for pct_key, raw_key in (("seq_wins_pixel_pct", "seq_wins_pixel"),
+                              ("seq_wins_latent_pct", "seq_wins_latent")):
+        agg["exp1b"][pct_key] = {
+            "mean": float(np.mean([r["exp1b_generative"][raw_key] /
+                                    r["exp1b_generative"]["n_seqs"]
+                                    for r in all_results])),
+            "std":  float(np.std([r["exp1b_generative"][raw_key] /
+                                   r["exp1b_generative"]["n_seqs"]
+                                   for r in all_results])),
+        }
 
     # ── Exp 2: schema distortion ──────────────────────────────────────────────
     for key in ("canonical_mad", "atypical_mad", "seq_mad", "iid_mad",
@@ -181,12 +195,24 @@ def _print_aggregate(agg):
     print("CONSOLIDATION EXPERIMENTS  (mean ± std across seeds)")
     print(f"{'='*70}")
 
-    e1 = agg["exp1"]
-    print(f"\n  Exp 1 — Episode completion (gap frames 5–9)")
-    print(f"    Sequential MSE:  {e1['seq_mse']['mean']:.5f} ± {e1['seq_mse']['std']:.5f}")
-    print(f"    IID-matched MSE: {e1['iid_mse']['mean']:.5f} ± {e1['iid_mse']['std']:.5f}")
-    win_pct = e1['seq_wins_pct']['mean'] * 100
-    print(f"    Seq wins {win_pct:.1f}% of sequences on average")
+    e1a = agg["exp1a"]
+    e1b = agg["exp1b"]
+    print(f"\n  Exp 1A — Probe-based completion (fully fair)")
+    print(f"    Sequential latent MSE:  {e1a['sequential']['latent_mse']['mean']:.5f} "
+          f"± {e1a['sequential']['latent_mse']['std']:.5f}")
+    print(f"    IID-matched latent MSE: {e1a['iid_matched']['latent_mse']['mean']:.5f} "
+          f"± {e1a['iid_matched']['latent_mse']['std']:.5f}")
+    adv = e1a['seq_vs_iid']['mean']
+    print(f"    Seq vs IID: {adv:+.5f} ± {e1a['seq_vs_iid']['std']:.5f} "
+          f"({'SEQ ✓' if adv < 0 else 'IID'})")
+
+    print(f"\n  Exp 1B — Native generative completion (behavioural)")
+    print(f"    Pixel MSE:  Seq={e1b['seq_mse']['mean']:.5f}  "
+          f"IID={e1b['iid_mse']['mean']:.5f}  "
+          f"Seq wins {e1b['seq_wins_pixel_pct']['mean']*100:.1f}%")
+    print(f"    Latent MSE: Seq={e1b['seq_latent_mse']['mean']:.5f}  "
+          f"IID={e1b['iid_latent_mse']['mean']:.5f}  "
+          f"Seq wins {e1b['seq_wins_latent_pct']['mean']*100:.1f}%")
 
     e2 = agg["exp2"]
     print(f"\n  Exp 2 — Schema distortion (MAD from canonical sweep)")
