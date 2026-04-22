@@ -4,40 +4,19 @@ experiment.py
 Four experiments translating the main consolidation signatures from
 Spens & Burgess (2024) into the sequential domain.
 
-Exp 1 — Partial-cue recall
-  Mask frames 5–9 of a held-out sequence. Each student reconstructs the
-  full sequence from the corrupted input. Measure reconstruction quality
-  on the masked frames in both pixel and teacher-latent space.
-  Analogous to Spens & Burgess Fig. 1d.
+All experiments compare three conditions:
+  sequential  — sequence VAE trained on temporally ordered replay
+  shuffled    — sequence VAE trained on shuffled replay (same arch, same pixels)
+  iid         — original Spens & Burgess frame-level VAE (MHN replay baseline)
 
-Exp 2 — Semanticisation over consolidation
-  Probe the sequence latent z_seq for episode-level semantic variables
-  (shape, object hue, trajectory direction) at multiple training
-  checkpoints (epochs 5, 10, 20, 30). Tests whether semantic structure
-  becomes increasingly decodable as replay consolidation progresses.
-  Analogous to Spens & Burgess Fig. 3a.
+Primary comparison: sequential vs shuffled (isolates temporal order)
+Secondary comparison: sequential vs iid (compares to original model)
 
-Exp 3 — Imagination and relational inference
-  Interpolate between pairs of episode latents and decode intermediate
-  sequences. Measure temporal smoothness and semantic consistency of
-  generated trajectories. Tests whether the latent space supports
-  structured generalisation beyond seen episodes.
-  Analogous to Spens & Burgess Fig. 3b–d.
-
-Exp 4 — Schema distortion
-  Feed each student a full atypical sequence (locally scrambled frame
-  order). Reconstruct through the student's own sequence decoder.
-  Recover the orientation trajectory of the reconstruction via
-  teacher nearest-neighbour lookup. Measure MAD from the canonical
-  monotonic sweep. True schema distortion because the student's own
-  generative process must produce the regularisation.
-  Analogous to Spens & Burgess Fig. 4.
-
-All experiments compare:
-  Primary:   sequential seq-VAE  vs  shuffled seq-VAE
-             (same architecture, same pixels — isolates temporal order)
-  Secondary: sequential seq-VAE  vs  IID frame-VAE
-             (compares to original Spens & Burgess baseline)
+The three-way comparison allows two claims:
+  (1) Sequential replay outperforms shuffled replay → temporal order matters
+  (2) Both sequential conditions outperform IID → sequence-level replay
+      (whether ordered or not) helps consolidation relative to the
+      original itemwise replay approach
 """
 
 import os
@@ -66,23 +45,34 @@ def _encode_sequences_to_z(seq_enc, teacher_enc,
                              imgs, seqs, batch=64):
     """
     Encode each episode (15 frames) to a single z_seq vector.
-
-    Pipeline:
-      frames (15, 64,64,3)
-        → frozen teacher encoder → frame latents (15, LATENT_DIM)
-        → seq encoder            → z_seq (SEQ_LATENT_DIM,)
-
+    For sequence VAE students (sequential and shuffled).
     Returns z_means: (N, SEQ_LATENT_DIM)
     """
     z_list = []
     for seq in seqs:
-        frames    = imgs[seq]                               # (15, 64,64,3)
+        frames    = imgs[seq]
         f_lat     = teacher_enc.predict(
-            frames, batch_size=SEQ_LENGTH, verbose=0)[0]   # (15, LATENT_DIM)
-        f_lat_exp = f_lat[np.newaxis]                      # (1, 15, LATENT_DIM)
+            frames, batch_size=SEQ_LENGTH, verbose=0)[0]
+        f_lat_exp = f_lat[np.newaxis]
         z_mean, _, _ = seq_enc.predict(f_lat_exp, verbose=0)
         z_list.append(z_mean[0])
-    return np.stack(z_list)                                # (N, SEQ_LATENT_DIM)
+    return np.stack(z_list)
+
+
+def _encode_sequences_to_z_iid(iid_enc, imgs, seqs):
+    """
+    Encode each episode to a single vector using the IID frame-level encoder.
+    Since the IID encoder is frame-level, we encode each frame independently
+    and mean-pool the resulting latents to get an episode-level representation.
+    Returns z_means: (N, LATENT_DIM)
+    """
+    z_list = []
+    for seq in seqs:
+        frames = imgs[seq]                                    # (15, 64,64,3)
+        z_mean = iid_enc.predict(
+            frames, batch_size=SEQ_LENGTH, verbose=0)[0]     # (15, LATENT_DIM)
+        z_list.append(z_mean.mean(axis=0))                   # (LATENT_DIM,)
+    return np.stack(z_list)                                   # (N, LATENT_DIM)
 
 
 def _reconstruct_sequence(seq_enc, seq_dec, teacher_enc, teacher_dec,
@@ -161,84 +151,98 @@ def exp1_partial_cue_recall(models,
                               gap_start=5, gap_end=10,
                               n_seqs=200, rng_seed=0):
     """
-    Partial-cue recall.  Analogous to Spens & Burgess Fig. 1d.
+    Partial-cue recall. Analogous to Spens & Burgess Fig. 1d.
 
-    Each 15-frame test sequence is presented with frames gap_start–gap_end-1
-    masked (set to zero).  Each student encodes the corrupted sequence through
-    its full pipeline (frame embedding → seq encoder → seq decoder → teacher
-    decoder) and produces a full sequence reconstruction.
+    Three conditions:
+      sequential / shuffled — encode corrupted sequence through seq VAE pipeline,
+                              reconstruct all 15 frames from z_seq.
+      iid                   — encode each frame independently through frame-level
+                              VAE, reconstruct each frame independently.
+                              The IID model has no episode-level representation,
+                              so masked frames are reconstructed from zero input
+                              (its best strategy given no temporal model).
 
-    We evaluate quality only on the MASKED frames, using two metrics:
-      Pixel MSE     — direct pixel comparison (shared scale for all students)
-      Latent MSE    — MSE in teacher latent space (removes decoder-sharpness
-                      differences between students)
-
-    Conditions compared:
-      sequential  — seq-VAE trained on ordered replay
-      shuffled    — seq-VAE trained on shuffled replay (same arch, same pixels)
-      iid         — original Spens & Burgess frame-level VAE (secondary)
+    Metrics on hidden gap frames only:
+      Pixel MSE   — direct pixel comparison
+      Latent MSE  — MSE in teacher latent space (removes decoder sharpness bias)
     """
     rng         = np.random.default_rng(rng_seed)
     idxs        = rng.choice(len(test_seqs),
-                              size=min(n_seqs, len(test_seqs)),
-                              replace=False)
+                              size=min(n_seqs, len(test_seqs)), replace=False)
     mask_idx    = list(range(gap_start, gap_end))
     gap_len     = gap_end - gap_start
     teacher_enc = models["teacher_enc"]
     teacher_dec = models["teacher_dec"]
 
-    students = {
-        "sequential": (models["seq_enc"],  models["seq_dec"]),
+    # Seq-VAE conditions (sequential and shuffled)
+    seq_vae_students = {
+        "sequential": (models["seq_enc"], models["seq_dec"]),
         "shuffled":   (models["shuf_enc"], models["shuf_dec"]),
     }
 
     results = {name: {"pixel_errors": [], "latent_errors": []}
-               for name in students}
+               for name in list(seq_vae_students.keys()) + ["iid"]}
 
     for i in idxs:
-        frames     = test_imgs[test_seqs[i]]             # (15, 64,64,3)
-        gap_frames = frames[gap_start:gap_end]            # ground truth gap
-
-        # Teacher latents for ground-truth gap (shared reference)
+        frames     = test_imgs[test_seqs[i]]
+        gap_frames = frames[gap_start:gap_end]
         gt_z = teacher_enc.predict(
-            gap_frames, batch_size=gap_len, verbose=0)[0]  # (gap_len, LATENT_DIM)
+            gap_frames, batch_size=gap_len, verbose=0)[0]
 
-        for name, (enc, dec) in students.items():
+        # ── Seq-VAE students ──────────────────────────────────────────────
+        for name, (enc, dec) in seq_vae_students.items():
             recon = _reconstruct_sequence(
                 enc, dec, teacher_enc, teacher_dec,
-                frames, mask_indices=mask_idx)              # (15, 64,64,3)
+                frames, mask_indices=mask_idx)
             recon_gap = recon[gap_start:gap_end]
-
-            # Pixel MSE on gap frames
-            pixel_err = float(np.mean((gap_frames - recon_gap) ** 2))
-            results[name]["pixel_errors"].append(pixel_err)
-
-            # Latent MSE: encode recon gap through teacher
+            results[name]["pixel_errors"].append(
+                float(np.mean((gap_frames - recon_gap) ** 2)))
             recon_z = teacher_enc.predict(
                 recon_gap, batch_size=gap_len, verbose=0)[0]
-            lat_err = float(np.mean((gt_z - recon_z) ** 2))
-            results[name]["latent_errors"].append(lat_err)
+            results[name]["latent_errors"].append(
+                float(np.mean((gt_z - recon_z) ** 2)))
+
+        # ── IID frame-VAE: reconstruct each frame independently ───────────
+        # Masked frames (the gap) are fed as zeros — the IID model has no
+        # temporal model so it cannot infer the gap from surrounding frames.
+        iid_enc = models["iid_enc"]
+        iid_dec = models["iid_dec"]
+        corrupted = frames.copy()
+        corrupted[mask_idx] = 0.0
+        z_iid = iid_enc.predict(
+            corrupted, batch_size=SEQ_LENGTH, verbose=0)[0]  # (15, LATENT_DIM)
+        recon_iid = iid_dec.predict(
+            z_iid, batch_size=SEQ_LENGTH, verbose=0)          # (15, 64,64,3)
+        recon_iid_gap = recon_iid[gap_start:gap_end]
+        results["iid"]["pixel_errors"].append(
+            float(np.mean((gap_frames - recon_iid_gap) ** 2)))
+        recon_iid_z = teacher_enc.predict(
+            recon_iid_gap, batch_size=gap_len, verbose=0)[0]
+        results["iid"]["latent_errors"].append(
+            float(np.mean((gt_z - recon_iid_z) ** 2)))
 
     out = {}
-    for name in students:
+    for name in ("sequential", "shuffled", "iid"):
         pe = np.array(results[name]["pixel_errors"])
         le = np.array(results[name]["latent_errors"])
         out[name] = {
-            "pixel_mse":     float(np.mean(pe)),
-            "pixel_mse_std": float(np.std(pe)),
-            "latent_mse":    float(np.mean(le)),
-            "latent_mse_std":float(np.std(le)),
+            "pixel_mse":      float(np.mean(pe)),
+            "pixel_mse_std":  float(np.std(pe)),
+            "latent_mse":     float(np.mean(le)),
+            "latent_mse_std": float(np.std(le)),
         }
 
-    # Win counts
-    seq_p = np.array(results["sequential"]["pixel_errors"])
+    seq_p  = np.array(results["sequential"]["pixel_errors"])
     shuf_p = np.array(results["shuffled"]["pixel_errors"])
-    seq_l = np.array(results["sequential"]["latent_errors"])
+    iid_p  = np.array(results["iid"]["pixel_errors"])
+    seq_l  = np.array(results["sequential"]["latent_errors"])
     shuf_l = np.array(results["shuffled"]["latent_errors"])
-    out["seq_wins_pixel"]  = int(np.sum(seq_p < shuf_p))
-    out["seq_wins_latent"] = int(np.sum(seq_l < shuf_l))
-    out["n_seqs"]          = len(idxs)
-
+    iid_l  = np.array(results["iid"]["latent_errors"])
+    out["seq_wins_pixel_vs_shuf"]  = int(np.sum(seq_p < shuf_p))
+    out["seq_wins_pixel_vs_iid"]   = int(np.sum(seq_p < iid_p))
+    out["seq_wins_latent_vs_shuf"] = int(np.sum(seq_l < shuf_l))
+    out["seq_wins_latent_vs_iid"]  = int(np.sum(seq_l < iid_l))
+    out["n_seqs"] = len(idxs)
     return out
 
 
@@ -280,7 +284,7 @@ def exp2_semanticisation(models, seed,
                                   "wall_hue", "scale")
                      if f in train_labels]
 
-    def _probe_at(seq_enc, seq_dec, label):
+    def _probe_at_seq(seq_enc, seq_dec, label):
         z_tr = _encode_sequences_to_z(
             seq_enc, teacher_enc, train_imgs, train_seqs[:n_train])
         z_te = _encode_sequences_to_z(
@@ -295,9 +299,9 @@ def exp2_semanticisation(models, seed,
             print(f"      [{label}] {factor}: acc={acc:.3f}  r2={r2:.3f}")
         return factor_results
 
-    results = {"sequential": {}, "shuffled": {}}
+    results = {"sequential": {}, "shuffled": {}, "iid": {}}
 
-    # Probe at each checkpoint epoch
+    # Probe at each checkpoint epoch (seq-VAE students only — IID has no checkpoints)
     for epoch in CHECKPOINT_EPOCHS:
         print(f"  Epoch {epoch}:")
         for cond, ckpt_d in (("sequential", ckpt_dir),
@@ -310,14 +314,31 @@ def exp2_semanticisation(models, seed,
             enc = keras.models.load_model(enc_path, compile=False)
             dec = keras.models.load_model(dec_path, compile=False)
             label = f"{cond} epoch {epoch}"
-            results[cond][f"epoch_{epoch}"] = _probe_at(enc, dec, label)
+            results[cond][f"epoch_{epoch}"] = _probe_at_seq(enc, dec, label)
 
-    # Probe final models
+    # Probe final seq-VAE models
     print(f"  Final model:")
     for cond, (enc, dec) in (("sequential", (models["seq_enc"], models["seq_dec"])),
                                ("shuffled",   (models["shuf_enc"], models["shuf_dec"]))):
-        results[cond]["final"] = _probe_at(enc, dec, f"{cond} final")
+        results[cond]["final"] = _probe_at_seq(enc, dec, f"{cond} final")
 
+    # Probe IID frame-VAE — use mean-pooled frame latents as episode representation
+    print(f"  IID frame-VAE:")
+    iid_enc = models["iid_enc"]
+
+    def _probe_iid():
+        z_tr = _encode_sequences_to_z_iid(iid_enc, train_imgs, train_seqs[:n_train])
+        z_te = _encode_sequences_to_z_iid(iid_enc, test_imgs,  test_seqs[:n_test])
+        factor_results = {}
+        for factor in probe_factors:
+            y_tr = train_labels[factor][:n_train]
+            y_te = test_labels[factor][:n_test]
+            acc, r2 = _probe(z_tr, y_tr, z_te, y_te)
+            factor_results[factor] = {"acc": acc, "r2": r2}
+            print(f"      [iid] {factor}: acc={acc:.3f}  r2={r2:.3f}")
+        return factor_results
+
+    results["iid"]["final"] = _probe_iid()
     return results
 
 
@@ -366,54 +387,30 @@ def exp3_imagination(models,
     for name, (seq_enc, seq_dec) in students.items():
         smoothness_scores = []
         validity_scores   = []
-
-        # Sample random pairs
         pair_idxs = [(rng.integers(n_seqs), rng.integers(n_seqs))
                      for _ in range(n_pairs)]
 
         for ia, ib in pair_idxs:
             frames_a = test_imgs[test_seqs[ia]]
             frames_b = test_imgs[test_seqs[ib]]
-
-            # Encode both episodes
             fa_lat = teacher_enc.predict(
                 frames_a, batch_size=SEQ_LENGTH, verbose=0)[0][np.newaxis]
             fb_lat = teacher_enc.predict(
                 frames_b, batch_size=SEQ_LENGTH, verbose=0)[0][np.newaxis]
-
-            z_a = seq_enc.predict(fa_lat, verbose=0)[0][0]  # (SEQ_LATENT_DIM,)
+            z_a = seq_enc.predict(fa_lat, verbose=0)[0][0]
             z_b = seq_enc.predict(fb_lat, verbose=0)[0][0]
-
-            # Canonical teacher latents for episode A (for orientation lookup)
             canonical_z = teacher_enc.predict(
                 frames_a, batch_size=SEQ_LENGTH, verbose=0)[0]
-
             ep_smooth, ep_valid = [], []
-
             for alpha in alphas:
-                z_interp = ((1 - alpha) * z_a +
-                             alpha      * z_b)[np.newaxis]   # (1, SEQ_LATENT_DIM)
-
-                # Decode
-                pred_latents = seq_dec.predict(
-                    z_interp, verbose=0)[0]                  # (15, LATENT_DIM)
+                z_interp = ((1 - alpha) * z_a + alpha * z_b)[np.newaxis]
+                pred_latents = seq_dec.predict(z_interp, verbose=0)[0]
                 recon = teacher_dec.predict(
                     pred_latents, batch_size=SEQ_LENGTH, verbose=0)
-
-                # Recover orientation trajectory
-                traj = _orientation_from_frames(
-                    recon, teacher_enc, canonical_z)
-
-                # Temporal smoothness: fraction of steps where orientation
-                # changes by at most 2 (tolerant measure of local order)
-                diffs = np.abs(np.diff(traj))
-                smooth = float(np.mean(diffs <= 2))
-                ep_smooth.append(smooth)
-
-                # Validity: all recovered orientations are in [0, 14]
-                valid = float(np.all((traj >= 0) & (traj < SEQ_LENGTH)))
-                ep_valid.append(valid)
-
+                traj   = _orientation_from_frames(recon, teacher_enc, canonical_z)
+                diffs  = np.abs(np.diff(traj))
+                ep_smooth.append(float(np.mean(diffs <= 2)))
+                ep_valid.append(float(np.all((traj >= 0) & (traj < SEQ_LENGTH))))
             smoothness_scores.append(np.mean(ep_smooth))
             validity_scores.append(np.mean(ep_valid))
 
@@ -426,6 +423,46 @@ def exp3_imagination(models,
         print(f"    [{name}] smoothness={results[name]['smoothness_mean']:.3f}  "
               f"validity={results[name]['validity_mean']:.3f}")
 
+    # IID: interpolate between mean-pooled frame latents
+    # The IID model has no episode-level decoder, so we decode each
+    # interpolated frame latent independently through the IID decoder.
+    iid_enc = models["iid_enc"]
+    iid_dec = models["iid_dec"]
+    iid_smooth, iid_valid = [], []
+    pair_idxs_iid = [(rng.integers(n_seqs), rng.integers(n_seqs))
+                     for _ in range(n_pairs)]
+
+    for ia, ib in pair_idxs_iid:
+        frames_a = test_imgs[test_seqs[ia]]
+        frames_b = test_imgs[test_seqs[ib]]
+        # Mean-pool frame latents as episode representation
+        z_a = iid_enc.predict(
+            frames_a, batch_size=SEQ_LENGTH, verbose=0)[0].mean(axis=0)
+        z_b = iid_enc.predict(
+            frames_b, batch_size=SEQ_LENGTH, verbose=0)[0].mean(axis=0)
+        canonical_z = teacher_enc.predict(
+            frames_a, batch_size=SEQ_LENGTH, verbose=0)[0]
+        ep_smooth, ep_valid = [], []
+        for alpha in alphas:
+            z_interp = (1 - alpha) * z_a + alpha * z_b   # (LATENT_DIM,)
+            # Tile interpolated latent across all 15 positions and decode
+            z_tiled = np.tile(z_interp[np.newaxis], (SEQ_LENGTH, 1))
+            recon = iid_dec.predict(z_tiled, batch_size=SEQ_LENGTH, verbose=0)
+            traj  = _orientation_from_frames(recon, teacher_enc, canonical_z)
+            diffs = np.abs(np.diff(traj))
+            ep_smooth.append(float(np.mean(diffs <= 2)))
+            ep_valid.append(float(np.all((traj >= 0) & (traj < SEQ_LENGTH))))
+        iid_smooth.append(np.mean(ep_smooth))
+        iid_valid.append(np.mean(ep_valid))
+
+    results["iid"] = {
+        "smoothness_mean": float(np.mean(iid_smooth)),
+        "smoothness_std":  float(np.std(iid_smooth)),
+        "validity_mean":   float(np.mean(iid_valid)),
+        "validity_std":    float(np.std(iid_valid)),
+    }
+    print(f"    [iid] smoothness={results['iid']['smoothness_mean']:.3f}  "
+          f"validity={results['iid']['validity_mean']:.3f}")
     return results
 
 
@@ -498,28 +535,35 @@ def exp4_schema_distortion(models,
     }
 
     atyp_mads   = []
-    recon_mads  = {name: [] for name in students}
+    recon_mads  = {name: [] for name in list(students.keys()) + ["iid"]}
+    iid_enc     = models["iid_enc"]
+    iid_dec     = models["iid_dec"]
 
     for i in idxs:
         true_frames = test_imgs[test_seqs[i]]
-
-        # Teacher latents for canonical frames (orientation lookup reference)
         canonical_z = teacher_enc.predict(
             true_frames, batch_size=SEQ_LENGTH, verbose=0)[0]
-
-        # Create atypical sequence
         atyp_frames, atyp_ori = _make_atypical_sequence(
             true_frames, rng, n_perturb)
         atyp_mads.append(_mad_from_canonical(atyp_ori))
 
+        # ── Seq-VAE students ──────────────────────────────────────────────
         for name, (seq_enc, seq_dec) in students.items():
-            # Reconstruct through student's full pipeline
             recon = _reconstruct_sequence(
                 seq_enc, seq_dec, teacher_enc, teacher_dec, atyp_frames)
-
-            # Recover orientation trajectory
-            traj = _orientation_from_frames(recon, teacher_enc, canonical_z)
+            traj  = _orientation_from_frames(recon, teacher_enc, canonical_z)
             recon_mads[name].append(_mad_from_canonical(traj))
+
+        # ── IID frame-VAE: reconstruct each frame independently ───────────
+        # The IID student reconstructs each frame from its own latent with no
+        # episode-level information. Any schema pull must come from the
+        # frame-level prior learned during replay.
+        z_iid   = iid_enc.predict(
+            atyp_frames, batch_size=SEQ_LENGTH, verbose=0)[0]  # (15, LATENT_DIM)
+        recon_iid = iid_dec.predict(
+            z_iid, batch_size=SEQ_LENGTH, verbose=0)            # (15, 64,64,3)
+        traj_iid  = _orientation_from_frames(recon_iid, teacher_enc, canonical_z)
+        recon_mads["iid"].append(_mad_from_canonical(traj_iid))
 
     atyp_arr = np.array(atyp_mads)
     out = {
@@ -528,7 +572,7 @@ def exp4_schema_distortion(models,
         "atypical_mad_std": float(np.std(atyp_arr)),
     }
 
-    for name in students:
+    for name in list(students.keys()) + ["iid"]:
         r_arr = np.array(recon_mads[name])
         out[name] = {
             "recon_mad":     float(np.mean(r_arr)),
@@ -539,10 +583,12 @@ def exp4_schema_distortion(models,
 
     seq_r  = np.array(recon_mads["sequential"])
     shuf_r = np.array(recon_mads["shuffled"])
-    out["seq_vs_shuffled"] = float(np.mean(seq_r) - np.mean(shuf_r))
-    out["seq_wins_vs_shuf"] = int(np.sum(seq_r < shuf_r))
-    out["n_seqs"]           = len(idxs)
-
+    iid_r  = np.array(recon_mads["iid"])
+    out["seq_vs_shuffled"]   = float(np.mean(seq_r) - np.mean(shuf_r))
+    out["seq_vs_iid"]        = float(np.mean(seq_r) - np.mean(iid_r))
+    out["seq_wins_vs_shuf"]  = int(np.sum(seq_r < shuf_r))
+    out["seq_wins_vs_iid"]   = int(np.sum(seq_r < iid_r))
+    out["n_seqs"]            = len(idxs)
     return out
 
 
@@ -563,11 +609,11 @@ def run(models,
     print("\n── Exp 1: Partial-cue recall ──")
     exp1 = exp1_partial_cue_recall(models, test_imgs, test_seqs)
     all_results["exp1"] = exp1
-    for name in ("sequential", "shuffled"):
+    for name in ("sequential", "shuffled", "iid"):
         print(f"  [{name}]  pixel MSE={exp1[name]['pixel_mse']:.5f}  "
               f"latent MSE={exp1[name]['latent_mse']:.5f}")
-    print(f"  Seq wins (pixel):  {exp1['seq_wins_pixel']}/{exp1['n_seqs']}")
-    print(f"  Seq wins (latent): {exp1['seq_wins_latent']}/{exp1['n_seqs']}")
+    print(f"  Seq vs shuffled (latent): {exp1['seq_wins_latent_vs_shuf']}/{exp1['n_seqs']}")
+    print(f"  Seq vs IID (latent):      {exp1['seq_wins_latent_vs_iid']}/{exp1['n_seqs']}")
 
     # ── Exp 2 ─────────────────────────────────────────────────────────────
     print("\n── Exp 2: Semanticisation over consolidation ──")
@@ -581,7 +627,7 @@ def run(models,
     print("\n── Exp 3: Imagination via latent interpolation ──")
     exp3 = exp3_imagination(models, test_imgs, test_seqs)
     all_results["exp3"] = exp3
-    for name in ("sequential", "shuffled"):
+    for name in ("sequential", "shuffled", "iid"):
         print(f"  [{name}]  smoothness={exp3[name]['smoothness_mean']:.3f}  "
               f"validity={exp3[name]['validity_mean']:.3f}")
 
@@ -591,12 +637,14 @@ def run(models,
     all_results["exp4"] = exp4
     print(f"  Canonical MAD:     {exp4['canonical_mad']:.3f}")
     print(f"  Atypical MAD:      {exp4['atypical_mad']:.3f}")
-    for name in ("sequential", "shuffled"):
+    for name in ("sequential", "shuffled", "iid"):
         print(f"  [{name}]  recon MAD={exp4[name]['recon_mad']:.3f}  "
               f"schema pull={exp4[name]['schema_pull']:+.3f}  "
               f"wins vs atypical={exp4[name]['wins_vs_atyp']}/{exp4['n_seqs']}")
     print(f"  Seq vs shuffled: {exp4['seq_vs_shuffled']:+.3f}  "
           f"seq wins {exp4['seq_wins_vs_shuf']}/{exp4['n_seqs']}")
+    print(f"  Seq vs IID:      {exp4['seq_vs_iid']:+.3f}  "
+          f"seq wins {exp4['seq_wins_vs_iid']}/{exp4['n_seqs']}")
 
     # ── Save & plot ────────────────────────────────────────────────────────
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
@@ -611,87 +659,86 @@ def run(models,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _save_plots(exp1, exp2, exp3, exp4, out_dir):
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    conditions = ["sequential", "shuffled", "iid"]
+    clr  = {"sequential": "coral", "shuffled": "steelblue", "iid": "mediumpurple"}
+    lbl  = {"sequential": "Sequential", "shuffled": "Shuffled", "iid": "IID (Spens)"}
 
-    # ── Panel 1: Partial-cue recall ───────────────────────────────────────
+    # ── Panel 1: Partial-cue recall — latent MSE ──────────────────────────
     ax = axes[0, 0]
-    names  = ["sequential", "shuffled"]
-    colors = ["coral", "steelblue"]
-    x = np.arange(2)
-    w = 0.35
-    p_vals = [exp1[n]["pixel_mse"]  for n in names]
-    l_vals = [exp1[n]["latent_mse"] for n in names]
-    p_errs = [exp1[n]["pixel_mse_std"]  for n in names]
-    l_errs = [exp1[n]["latent_mse_std"] for n in names]
-    ax.bar(x - w/2, p_vals, w, yerr=p_errs, label="Pixel MSE",
-           color=colors, alpha=0.85, capsize=4)
-    ax.bar(x + w/2, l_vals, w, yerr=l_errs, label="Latent MSE",
-           color=colors, alpha=0.5, hatch="//", capsize=4)
-    ax.set_xticks(x)
-    ax.set_xticklabels(["Sequential", "Shuffled"])
-    ax.set_ylabel("MSE on masked frames (lower = better)")
-    ax.set_title("Exp 1: Partial-cue recall\n(frames 5–9 masked)")
-    ax.legend(fontsize=8)
+    x  = np.arange(len(conditions))
+    l_vals = [exp1[n]["latent_mse"]     for n in conditions]
+    l_errs = [exp1[n]["latent_mse_std"] for n in conditions]
+    bars = ax.bar(x, l_vals, yerr=l_errs,
+                   color=[clr[n] for n in conditions],
+                   alpha=0.85, capsize=5, width=0.5)
+    for bar, v in zip(bars, l_vals):
+        ax.text(bar.get_x() + bar.get_width()/2, v + max(l_vals)*0.02,
+                f"{v:.4f}", ha="center", va="bottom", fontsize=8)
+    ax.set_xticks(x); ax.set_xticklabels([lbl[n] for n in conditions])
+    ax.set_ylabel("Latent MSE on masked frames (lower = better)")
+    ax.set_title("Exp 1: Partial-cue recall\n(frames 5–9 masked, teacher latent space)")
 
     # ── Panel 2: Semanticisation over epochs ──────────────────────────────
     ax = axes[0, 1]
-    epochs = CHECKPOINT_EPOCHS + ["final"]
-    x_epochs = list(range(len(epochs)))
-    for name, color in (("sequential", "coral"), ("shuffled", "steelblue")):
+    epoch_keys = [f"epoch_{e}" for e in CHECKPOINT_EPOCHS] + ["final"]
+    x_ep = list(range(len(epoch_keys)))
+    for name in ("sequential", "shuffled"):
         mean_accs = []
-        for ep_key in [f"epoch_{e}" for e in CHECKPOINT_EPOCHS] + ["final"]:
-            if ep_key in exp2[name]:
-                accs = [v["acc"] for v in exp2[name][ep_key].values()]
-                mean_accs.append(np.mean(accs))
+        for ek in epoch_keys:
+            if ek in exp2[name]:
+                mean_accs.append(np.mean([v["acc"] for v in exp2[name][ek].values()]))
             else:
                 mean_accs.append(float("nan"))
-        ax.plot(x_epochs, mean_accs, marker="o", label=name, color=color)
-    ax.set_xticks(x_epochs)
-    ax.set_xticklabels([str(e) for e in CHECKPOINT_EPOCHS] + ["final"],
-                        rotation=15)
-    ax.axhline(0.25, ls="--", c="gray", lw=0.8, label="Chance (~0.25)")
-    ax.set_ylabel("Mean probe accuracy (episode semantics)")
+        ax.plot(x_ep, mean_accs, marker="o", label=lbl[name], color=clr[name])
+    if "final" in exp2.get("iid", {}):
+        iid_acc = np.mean([v["acc"] for v in exp2["iid"]["final"].values()])
+        ax.axhline(iid_acc, ls="--", color=clr["iid"],
+                   label=f"{lbl['iid']} (final)", lw=1.5)
+    ax.set_xticks(x_ep)
+    ax.set_xticklabels([str(e) for e in CHECKPOINT_EPOCHS] + ["final"], rotation=15)
+    ax.axhline(0.25, ls=":", c="gray", lw=0.8, label="Chance")
+    ax.set_ylabel("Mean probe accuracy")
     ax.set_title("Exp 2: Semanticisation\n(episode-level probe accuracy vs epoch)")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=7)
 
-    # ── Panel 3: Imagination smoothness ──────────────────────────────────
+    # ── Panel 3: Imagination smoothness ───────────────────────────────────
     ax = axes[1, 0]
-    names  = ["sequential", "shuffled"]
-    smooth = [exp3[n]["smoothness_mean"] for n in names]
-    s_err  = [exp3[n]["smoothness_std"]  for n in names]
-    bars = ax.bar(["Sequential", "Shuffled"], smooth,
-                   yerr=s_err, color=["coral", "steelblue"],
-                   alpha=0.85, capsize=5, width=0.5)
-    for bar, v in zip(bars, smooth):
+    x3     = np.arange(len(conditions))
+    smooth = [exp3[n]["smoothness_mean"] for n in conditions]
+    s_err  = [exp3[n]["smoothness_std"]  for n in conditions]
+    bars3 = ax.bar(x3, smooth, yerr=s_err,
+                    color=[clr[n] for n in conditions],
+                    alpha=0.85, capsize=5, width=0.5)
+    for bar, v in zip(bars3, smooth):
         ax.text(bar.get_x() + bar.get_width()/2, v + 0.01,
                 f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+    ax.set_xticks(x3); ax.set_xticklabels([lbl[n] for n in conditions])
     ax.set_ylim(0, 1.05)
     ax.set_ylabel("Temporal smoothness (higher = better)")
     ax.set_title("Exp 3: Imagination\n(interpolated sequence smoothness)")
 
     # ── Panel 4: Schema distortion ────────────────────────────────────────
     ax = axes[1, 1]
-    labels = ["Canonical\n(ref)", "Atypical\ninput",
-              "Seq\nrecon", "Shuffled\nrecon"]
-    vals   = [exp4["canonical_mad"], exp4["atypical_mad"],
-              exp4["sequential"]["recon_mad"],
-              exp4["shuffled"]["recon_mad"]]
-    errs   = [0, exp4["atypical_mad_std"],
-              exp4["sequential"]["recon_mad_std"],
-              exp4["shuffled"]["recon_mad_std"]]
-    colors4 = ["seagreen", "gray", "coral", "steelblue"]
-    bars4 = ax.bar(labels, vals, yerr=errs, color=colors4,
-                    alpha=0.85, capsize=5, width=0.6)
-    for bar, v in zip(bars4, vals):
+    bar_labels = ["Canonical\n(ref)", "Atypical\ninput"] + \
+                 [lbl[n] + "\nrecon" for n in conditions]
+    vals4  = [exp4["canonical_mad"], exp4["atypical_mad"]] + \
+             [exp4[n]["recon_mad"] for n in conditions]
+    errs4  = [0, exp4["atypical_mad_std"]] + \
+             [exp4[n]["recon_mad_std"] for n in conditions]
+    colors4 = ["seagreen", "gray"] + [clr[n] for n in conditions]
+    bars4 = ax.bar(bar_labels, vals4, yerr=errs4,
+                    color=colors4, alpha=0.85, capsize=4, width=0.55)
+    for bar, v in zip(bars4, vals4):
         ax.text(bar.get_x() + bar.get_width()/2, v + 0.05,
-                f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+                f"{v:.2f}", ha="center", va="bottom", fontsize=8)
     ax.set_ylabel("MAD from canonical sweep (lower = more canonical)")
     ax.set_title("Exp 4: Schema distortion\n"
                  "(does reconstruction pull toward canonical?)")
 
     plt.suptitle(
         "Sequential replay consolidation experiments\n"
-        "Primary comparison: sequential vs shuffled seq-VAE",
+        "Sequential vs Shuffled (primary)  ·  Sequential vs IID Spens (secondary)",
         fontsize=11)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "consolidation_experiments.png"), dpi=150)
