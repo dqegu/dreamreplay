@@ -66,15 +66,15 @@ V_PATH           = os.path.join(ART_DIR, "V.npy")
 def student_paths(seed: int) -> dict:
     s = seed
     return {
-        # Sequence VAE — sequential replay (ordered)
+        # Sequential seq-VAE (ordered replay)
         "seq_vae_enc":  os.path.join(ART_DIR, f"seq_vae_encoder_s{s}.keras"),
         "seq_vae_dec":  os.path.join(ART_DIR, f"seq_vae_decoder_s{s}.keras"),
-        # Sequence VAE — shuffled ablation (same architecture, random order)
+        # Shuffled seq-VAE (same architecture, random frame order)
         "shuf_vae_enc": os.path.join(ART_DIR, f"shuf_vae_encoder_s{s}.keras"),
         "shuf_vae_dec": os.path.join(ART_DIR, f"shuf_vae_decoder_s{s}.keras"),
-        # Original frame-level IID VAE (Spens & Burgess baseline)
-        "iid_enc":      os.path.join(ART_DIR, f"iid_encoder_s{s}.keras"),
-        "iid_dec":      os.path.join(ART_DIR, f"iid_decoder_s{s}.keras"),
-        # Checkpoint directory for Exp 2
+        # IID seq-VAE (same architecture, independent MHN frames — no temporal structure)
+        "iid_enc":      os.path.join(ART_DIR, f"iid_vae_encoder_s{s}.keras"),
+        "iid_dec":      os.path.join(ART_DIR, f"iid_vae_decoder_s{s}.keras"),
+        # Checkpoint directories for semanticisation probing across epochs
         "seq_ckpt_dir": os.path.join(ART_DIR, f"seq_vae_checkpoints_s{s}"),
     }

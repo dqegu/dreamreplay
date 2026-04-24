@@ -203,38 +203,89 @@ def train_or_load_seq_vae(replay_sequences: np.ndarray,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# IID frame VAE (original Spens & Burgess baseline)
+# IID sequence VAE (Spens & Burgess baseline — same architecture as others)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def train_or_load_iid_vae(train_imgs, teacher_enc, teacher_dec,
-                           seed: int, force: bool = False):
+def _build_iid_seq_corpus(train_imgs: np.ndarray,
+                           teacher_enc, teacher_dec,
+                           n_sequences: int,
+                           rng: np.random.Generator) -> np.ndarray:
     """
-    Train original Spens & Burgess frame-level IID VAE on MHN-replayed frames.
+    Build IID replay corpus as (N, SEQ_LENGTH, 64, 64, 3) sequences.
+
+    Each "sequence" is constructed by sampling SEQ_LENGTH frames
+    independently at random from the MHN (with noise), then assembling
+    them into a sequence array.  There is no temporal relationship
+    between frames within a sequence — this is itemwise replay
+    repackaged into episode-shaped arrays so all three students can
+    use the identical sequence VAE architecture and objective.
+
+    This mirrors the Spens & Burgess replay mechanism (random noise →
+    MHN → retrieved frame) but produces sequences of the same shape
+    as the other students' replay data.
+    """
+    from replay import LatentMHN
+
+    print("    [IID] Encoding training frames for MHN...")
+    z_means = teacher_enc.predict(
+        train_imgs, batch_size=256, verbose=0)[0]
+
+    print("    [IID] Fitting latent MHN...")
+    mhn = LatentMHN()
+    mhn.fit(z_means)
+
+    total_frames = n_sequences * SEQ_LENGTH
+    print(f"    [IID] Retrieving {total_frames} independent frames...")
+    idxs    = rng.choice(len(z_means), size=total_frames, replace=True)
+    queries = (z_means[idxs] +
+               rng.standard_normal((total_frames, z_means.shape[1])) * 0.3)
+    retrieved = mhn.retrieve(queries.astype("float32"))
+    frames    = teacher_dec.predict(
+        retrieved, batch_size=256, verbose=0).astype("float32")
+
+    # Reshape into (N, SEQ_LENGTH, 64, 64, 3) — no temporal ordering
+    sequences = frames.reshape(n_sequences, SEQ_LENGTH, 64, 64, 3)
+    return sequences
+
+
+def train_or_load_iid_seq_vae(replay_sequences: np.ndarray,
+                               teacher_enc, teacher_dec,
+                               seed: int,
+                               force: bool = False):
+    """
+    Train the IID sequence VAE student.
+
+    Same architecture and objective as the sequential and shuffled students.
+    Replay corpus: SEQ_LENGTH independently MHN-retrieved frames assembled
+    into sequences — no temporal structure between frames.
+
+    This is the fairest possible Spens & Burgess baseline: the only
+    difference from the sequential student is that its replay sequences
+    contain no temporal ordering information.
     """
     paths    = student_paths(seed)
     enc_path = paths["iid_enc"]
     dec_path = paths["iid_dec"]
+    ckpt_dir = paths["seq_ckpt_dir"].replace("seq_vae", "iid_vae")
 
     if os.path.exists(enc_path) and os.path.exists(dec_path) and not force:
-        print(f"  Loading saved IID frame-VAE (seed={seed}).")
+        print(f"  Loading saved IID seq-VAE (seed={seed}).")
         enc = keras.models.load_model(enc_path, compile=False)
         dec = keras.models.load_model(dec_path, compile=False)
         return enc, dec
 
     set_seed(seed)
-    print(f"  Generating MHN replay for IID student (seed={seed})...")
-    replay_imgs = build_iid_replay(train_imgs, teacher_enc, teacher_dec)
+    rng = np.random.default_rng(seed)
 
-    enc = build_frame_encoder(LATENT_DIM)
-    dec = build_frame_decoder(LATENT_DIM)
-    trainer = VAETrainer(enc, dec, kl_weight=STUDENT_KL_WEIGHT)
-    trainer.compile(optimizer=keras.optimizers.Adam(1e-3))
-    trainer.fit(replay_imgs, epochs=STUDENT_EPOCHS,
-                batch_size=BATCH_SIZE, verbose=2)
-    enc.save(enc_path)
-    dec.save(dec_path)
-    print(f"  IID frame-VAE saved (seed={seed}).")
-    return enc, dec
+    print(f"  Building IID replay corpus from shared replay frames (seed={seed})...")
+    iid_sequences = _build_iid_seq_corpus_from_replay(replay_sequences, rng)
+    print(f"  Generated {len(iid_sequences)} IID replay sequences.")
+
+    print(f"  Training IID seq-VAE (seed={seed})...")
+    return _train_seq_vae(
+        iid_sequences, teacher_enc, teacher_dec,
+        enc_path, dec_path, ckpt_dir,
+        seed=seed, shuffle_frames=False, label="iid")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -278,26 +329,28 @@ def run_training_pipeline(train_imgs, train_seqs, seed: int,
         replay_sequences, teacher_enc, teacher_dec,
         seed=seed, shuffle_frames=True, force=force_students)
 
-    # 6. IID frame-VAE (Spens & Burgess baseline)
-    print(f"\n[6/5] IID frame-VAE baseline (seed={seed})")
-    iid_enc, iid_dec = train_or_load_iid_vae(
-        train_imgs, teacher_enc, teacher_dec,
+    # 6. IID seq-VAE (Spens & Burgess baseline — same architecture)
+    print(f"\n[6/6] IID seq-VAE baseline (seed={seed})")
+    iid_enc, iid_dec = train_or_load_iid_seq_vae(
+        replay_sequences, teacher_enc, teacher_dec,
         seed=seed, force=force_students)
 
     return {
         "teacher_enc": teacher_enc, "teacher_dec": teacher_dec,
         "K": K, "V": V,
         "replay_sequences": replay_sequences,
-        # Sequential seq-VAE (primary condition)
+        # Sequential seq-VAE (ordered replay)
         "seq_enc": seq_enc, "seq_dec": seq_dec,
-        # Shuffled seq-VAE (ablation — same arch, broken order)
+        # Shuffled seq-VAE (same pixels, random order)
         "shuf_enc": shuf_enc, "shuf_dec": shuf_dec,
-        # IID frame-VAE (Spens & Burgess baseline)
+        # IID seq-VAE (independent MHN frames, no temporal structure)
         "iid_enc": iid_enc, "iid_dec": iid_dec,
-        # Paths for loading checkpoints in Exp 2
+        # Checkpoint dirs for Exp 2
         "seq_ckpt_dir":  student_paths(seed)["seq_ckpt_dir"],
         "shuf_ckpt_dir": student_paths(seed)["seq_ckpt_dir"].replace(
             "seq_vae", "shuf_vae"),
+        "iid_ckpt_dir":  student_paths(seed)["seq_ckpt_dir"].replace(
+            "seq_vae", "iid_vae"),
         "seed": seed,
     }
 
@@ -318,3 +371,43 @@ def build_sequential_replay_sequences(train_imgs, K, V,
     from config import N_CHAINS, CHAIN_LENGTH, BETA_KV, TOPK
     from replay import kv_retrieve, build_replay_sequences
     return build_replay_sequences(train_imgs, K, V, teacher_enc, teacher_dec)
+
+
+def _build_iid_seq_corpus_from_replay(
+        replay_sequences: np.ndarray,
+        rng: np.random.Generator) -> np.ndarray:
+    """
+    Build IID replay corpus from the same replay frames used by the
+    sequential and shuffled students.
+
+    Input:
+        replay_sequences: (N, SEQ_LENGTH, 64, 64, 3)
+
+    Output:
+        iid_sequences: (N, SEQ_LENGTH, 64, 64, 3)
+
+    Each IID sequence is made by sampling frames independently from the
+    flattened replay corpus. This removes episode/order structure while
+    keeping the same replay frame distribution.
+    """
+    n_sequences = replay_sequences.shape[0]
+
+    flat_frames = replay_sequences.reshape(
+        -1,
+        replay_sequences.shape[2],
+        replay_sequences.shape[3],
+        replay_sequences.shape[4],
+    )
+
+    total_frames = n_sequences * SEQ_LENGTH
+    idxs = rng.choice(len(flat_frames), size=total_frames, replace=True)
+
+    iid_sequences = flat_frames[idxs].reshape(
+        n_sequences,
+        SEQ_LENGTH,
+        replay_sequences.shape[2],
+        replay_sequences.shape[3],
+        replay_sequences.shape[4],
+    ).astype("float32")
+
+    return iid_sequences
