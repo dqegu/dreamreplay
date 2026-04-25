@@ -37,20 +37,17 @@ def load_keras_model(path):
     )
 
 
-def plot_row(ax, row, frames, label):
+def plot_row(ax_row, frames, label, fig, row_idx, n_rows):
     for t in range(frames.shape[0]):
-        ax[row, t].imshow(np.clip(frames[t], 0, 1))
-        ax[row, t].axis("off")
+        ax_row[t].imshow(np.clip(frames[t], 0, 1))
+        ax_row[t].axis("off")
 
-    # Put label ONLY on the first column of the row
-    ax[row, 0].set_ylabel(
-        label,
-        rotation=0,          # horizontal text
-        labelpad=50,         # spacing from images
-        va="center",         # vertically centered
-        ha="right",          # align nicely to grid
-        fontsize=10,
-        fontweight="bold"
+    y_pos = 1.0 - (row_idx + 0.5) / n_rows
+    fig.text(
+        0.01, y_pos, label,
+        va="center", ha="left",
+        fontsize=10, fontweight="bold",
+        transform=fig.transFigure,
     )
 
 def main():
@@ -100,10 +97,11 @@ def main():
         ("IID\nReplay", iid_recon),
     ]
 
-    fig, ax = plt.subplots(len(rows), frames.shape[0], figsize=(15, 5))
+    fig, ax = plt.subplots(len(rows), frames.shape[0], figsize=(18, 5))
+    fig.subplots_adjust(left=0.08)  # leave room for labels on the left
 
     for row_idx, (label, row_frames) in enumerate(rows):
-        plot_row(ax, row_idx, row_frames, label)
+        plot_row(ax[row_idx], row_frames, label, fig, row_idx, len(rows))
 
     for t in range(frames.shape[0]):
         ax[0, t].set_title(str(t), fontsize=8)
@@ -112,7 +110,6 @@ def main():
         "Partial-cue episode reconstruction: frames 5–9 masked",
         fontsize=11,
     )
-    plt.tight_layout()
     plt.savefig(OUT_PATH, dpi=200, bbox_inches="tight")
     plt.close()
 
