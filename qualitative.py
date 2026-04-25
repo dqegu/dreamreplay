@@ -42,15 +42,16 @@ def plot_row(ax, row, frames, label):
         ax[row, t].imshow(np.clip(frames[t], 0, 1))
         ax[row, t].axis("off")
 
-        if t == 0:
-            ax[row, t].set_ylabel(
-                label,
-                rotation=0,
-                labelpad=45,
-                va="center",
-                fontsize=9,
-            )
-
+    # Put label ONLY on the first column of the row
+    ax[row, 0].set_ylabel(
+        label,
+        rotation=0,          # horizontal text
+        labelpad=50,         # spacing from images
+        va="center",         # vertically centered
+        ha="right",          # align nicely to grid
+        fontsize=10,
+        fontweight="bold"
+    )
 
 def main():
     print("Loading Shapes3D...")
@@ -92,11 +93,11 @@ def main():
 
     print("Plotting...")
     rows = [
-        ("Ground truth", frames),
-        ("Corrupted input", corrupted),
-        ("Sequential", seq_recon),
-        ("Shuffled", shuf_recon),
-        ("IID", iid_recon),
+        ("Ground\nTruth", frames),
+        ("Corrupted\nInput", corrupted),
+        ("Sequential\nReplay", seq_recon),
+        ("Shuffled\nReplay", shuf_recon),
+        ("IID\nReplay", iid_recon),
     ]
 
     fig, ax = plt.subplots(len(rows), frames.shape[0], figsize=(15, 5))
